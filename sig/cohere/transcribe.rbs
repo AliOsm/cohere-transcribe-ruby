@@ -1,0 +1,250 @@
+module Cohere
+  module Transcribe
+    VERSION: String
+    PUBLIC_API: Array[String]
+    DEFAULT_ASR_MODEL_ID: String
+    DEFAULT_ASR_MODEL_REVISION: String
+    SAMPLE_RATE: Integer
+
+    type path_input = String | _ToPath
+    type audio_input = path_input | Array[path_input]
+    type language = "ar" | "en"
+    type output_format = "txt" | "srt" | "vtt" | "json"
+    type result_status = "completed" | "failed" | "skipped"
+    type progress_callback = ^(ProgressEvent) -> void
+
+    interface _ToPath
+      def to_path: () -> String
+    end
+
+    class PublicationOptions
+      attr_reader formats: Array[output_format]?
+      attr_reader output_dir: Pathname?
+      attr_reader existing: String
+      attr_reader profile_json: Pathname?
+
+      def self.new: (?formats: Array[output_format]?, ?output_dir: path_input?, ?existing: String,
+                     ?profile_json: path_input?) -> PublicationOptions
+    end
+
+    class TranscriptionOptions
+      attr_reader model: path_input
+      attr_reader model_revision: String?
+      attr_reader adapter: path_input?
+      attr_reader adapter_revision: String?
+      attr_reader language: language
+      attr_reader text_only: bool
+      attr_reader recursive: bool
+      attr_reader device: String
+      attr_reader dtype: String
+      attr_reader audio_backend: String
+      attr_reader audio_memory_gb: Float
+      attr_reader preprocess_workers: Integer?
+      attr_reader pipeline_preparation: bool
+      attr_reader vad: String
+      attr_reader vad_engine: String
+      attr_reader vad_batch_size: Integer
+      attr_reader vad_block_frames: Integer
+      attr_reader vad_threads: Integer?
+      attr_reader vad_merge: bool
+      attr_reader min_dur: Float
+      attr_reader max_dur: Float
+      attr_reader max_silence: Float
+      attr_reader energy_threshold: Float
+      attr_reader vad_threshold: Float
+      attr_reader min_silence_ms: Integer
+      attr_reader speech_pad_ms: Integer
+      attr_reader batch_size: Integer?
+      attr_reader batch_max_size: Integer?
+      attr_reader batch_audio_seconds: Float?
+      attr_reader batch_vram_target: Float
+      attr_reader adaptive_batch: bool
+      attr_reader pin_memory: bool
+      attr_reader max_new_tokens: Integer
+      attr_reader max_retry_tokens: Integer
+      attr_reader truncation_policy: String
+      attr_reader stop_repetition_loops: bool
+      attr_reader alignment: String
+      attr_reader align_batch_size: Integer
+      attr_reader align_dtype: String
+      attr_reader max_chars: Integer
+      attr_reader max_cue_dur: Float
+      attr_reader max_gap: Float
+      attr_reader publication: PublicationOptions?
+
+      def self.new: (?model: path_input, ?model_revision: String?, ?adapter: path_input?,
+                     ?adapter_revision: String?, ?language: language, ?text_only: bool,
+                     ?recursive: bool, ?device: String, ?dtype: String,
+                     ?audio_backend: String, ?audio_memory_gb: Float,
+                     ?preprocess_workers: Integer?, ?pipeline_preparation: bool,
+                     ?vad: String, ?vad_engine: String, ?vad_batch_size: Integer,
+                     ?vad_block_frames: Integer, ?vad_threads: Integer?, ?vad_merge: bool,
+                     ?min_dur: Float, ?max_dur: Float, ?max_silence: Float,
+                     ?energy_threshold: Float, ?vad_threshold: Float,
+                     ?min_silence_ms: Integer, ?speech_pad_ms: Integer,
+                     ?batch_size: Integer?, ?batch_max_size: Integer?,
+                     ?batch_audio_seconds: Float?, ?batch_vram_target: Float,
+                     ?adaptive_batch: bool, ?pin_memory: bool, ?max_new_tokens: Integer,
+                     ?max_retry_tokens: Integer, ?truncation_policy: String,
+                     ?stop_repetition_loops: bool, ?alignment: String,
+                     ?align_batch_size: Integer, ?align_dtype: String, ?max_chars: Integer,
+                     ?max_cue_dur: Float, ?max_gap: Float,
+                     ?publication: PublicationOptions?) -> TranscriptionOptions
+    end
+
+    class TranscriptionSegment
+      attr_reader index: Integer
+      attr_reader start: Float
+      attr_reader end: Float
+      attr_reader text: String
+      def self.new: (index: Integer, start: Float, end: Float, text: String) -> TranscriptionSegment
+    end
+
+    class TranscriptionWord
+      attr_reader start: Float
+      attr_reader end: Float
+      attr_reader text: String
+      attr_reader segment_index: Integer
+      attr_reader segment_word_index: Integer
+      attr_reader timing_source: String
+      def self.new: (start: Float, end: Float, text: String, segment_index: Integer,
+                     segment_word_index: Integer, timing_source: String) -> TranscriptionWord
+    end
+
+    class SubtitleCue
+      attr_reader start: Float
+      attr_reader end: Float
+      attr_reader text: String
+      def self.new: (start: Float, end: Float, text: String) -> SubtitleCue
+    end
+
+    class TranscriptionProvenance
+      attr_reader model_id: String?
+      attr_reader model_revision: String?
+      attr_reader model_format: String?
+      attr_reader adapter_id: String?
+      attr_reader adapter_revision: String?
+      attr_reader decode_backend: String?
+      attr_reader decode_fallback_reason: String?
+      attr_reader vad_engine_requested: String?
+      attr_reader vad_engine_actual: String?
+      attr_reader vad_provider: String?
+      attr_reader vad_fallback_reason: String?
+      attr_reader fallback_alignment_segments: Integer
+      attr_reader repetition_stopped_segments: Array[Integer]
+      attr_reader truncation_retried_segments: Array[Integer]
+      attr_reader token_limit_segments: Array[Integer]
+      attr_reader generated_tokens_by_segment: Array[[Integer, Integer]]
+      attr_reader resumed_from_asr_checkpoint: bool
+      attr_reader published: bool
+      def self.new: (**untyped) -> TranscriptionProvenance
+    end
+
+    class TranscriptionResult
+      attr_reader path: Pathname
+      attr_reader relative_path: Pathname
+      attr_reader status: result_status
+      attr_reader text: String?
+      attr_reader duration: Float?
+      attr_reader segments: Array[TranscriptionSegment]
+      attr_reader words: Array[TranscriptionWord]
+      attr_reader cues: Array[SubtitleCue]
+      attr_reader outputs: Array[Pathname]
+      attr_reader error: String?
+      attr_reader provenance: TranscriptionProvenance
+      def self.new: (**untyped) -> TranscriptionResult
+    end
+
+    class TranscriptionStatistics
+      attr_reader elapsed_seconds: Float
+      attr_reader successful_audio_seconds: Float
+      attr_reader real_time_factor_x: Float
+      attr_reader runtime_import_seconds: Float
+      attr_reader serialization_wait_seconds: Float
+      attr_reader input_validation_seconds: Float
+      attr_reader decode_seconds: Float
+      attr_reader vad_seconds: Float
+      attr_reader asr_load_seconds: Float
+      attr_reader asr_seconds: Float
+      attr_reader aligner_load_seconds: Float
+      attr_reader emissions_seconds: Float
+      attr_reader viterbi_seconds: Float
+      attr_reader peak_cuda_allocated_gib: Float
+      attr_reader peak_cuda_reserved_gib: Float
+      attr_reader asr_batches: Integer
+      attr_reader asr_processor_rows: Integer
+      attr_reader generated_tokens: Integer
+      attr_reader oom_retries: Integer
+      attr_reader truncation_retries: Integer
+      def self.new: (**untyped) -> TranscriptionStatistics
+    end
+
+    class ProgressEvent
+      attr_reader stage: String
+      attr_reader message: String?
+      attr_reader current: Integer?
+      attr_reader total: Integer?
+      def self.new: (stage: String, ?message: String?, ?current: Integer?, ?total: Integer?) -> ProgressEvent
+    end
+
+    class TranscriptionRun
+      include Enumerable[TranscriptionResult]
+      attr_reader results: Array[TranscriptionResult]
+      attr_reader requested_options: TranscriptionOptions
+      attr_reader resolved_options: TranscriptionOptions
+      attr_reader statistics: TranscriptionStatistics
+      attr_reader errors: Array[String]
+      def each: () { (TranscriptionResult) -> void } -> self
+              | () -> Enumerator[TranscriptionResult, self]
+      def length: () -> Integer
+      alias size length
+      def []: (Integer) -> TranscriptionResult
+            | (Range[Integer?]) -> Array[TranscriptionResult]
+            | (Integer, Integer) -> Array[TranscriptionResult]
+      def single: () -> TranscriptionResult
+      def successful: () -> Array[TranscriptionResult]
+      def failed: () -> Array[TranscriptionResult]
+      def skipped: () -> Array[TranscriptionResult]
+      def ok?: () -> bool
+      alias ok ok?
+    end
+
+    class Error < StandardError
+    end
+    class TranscriptionError < Error
+    end
+    class TranscriptionConfigurationError < TranscriptionError
+    end
+    class TranscriptionInputError < TranscriptionError
+    end
+    class TranscriptionRuntimeError < TranscriptionError
+    end
+    class ProgressCallbackError < TranscriptionError
+      attr_reader original: Exception
+    end
+    class TranscriberClosedError < TranscriptionError
+    end
+    class TranscriberBusyError < TranscriptionError
+    end
+    class BatchTranscriptionError < TranscriptionError
+      attr_reader run: TranscriptionRun
+    end
+
+    class Transcriber
+      attr_reader options: TranscriptionOptions
+      attr_reader progress: progress_callback?
+      def initialize: (?TranscriptionOptions? options, ?progress: progress_callback?) -> void
+                    | (?options: TranscriptionOptions?, ?progress: progress_callback?) -> void
+      def transcribe: (audio_input audio, ?raise_on_error: bool) -> TranscriptionRun
+      def close: () -> nil
+      def closed?: () -> bool
+      def self.open: (?TranscriptionOptions? options, ?progress: progress_callback?) -> Transcriber
+                   | [T] (?TranscriptionOptions? options, ?progress: progress_callback?) { (Transcriber) -> T } -> T
+                   | (?options: TranscriptionOptions?, ?progress: progress_callback?) -> Transcriber
+                   | [T] (?options: TranscriptionOptions?, ?progress: progress_callback?) { (Transcriber) -> T } -> T
+    end
+
+    def self.transcribe: (audio_input audio, ?options: TranscriptionOptions?,
+                          ?progress: progress_callback?, ?raise_on_error: bool) -> TranscriptionRun
+  end
+end

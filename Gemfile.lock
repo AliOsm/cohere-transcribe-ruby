@@ -1,0 +1,136 @@
+PATH
+  remote: .
+  specs:
+    cohere-transcribe (0.1.0)
+      fiddle (>= 1.1, < 2.0)
+      numo-narray (>= 0.9.2, < 1.0)
+      onnxruntime (>= 0.11, < 1.0)
+
+GEM
+  remote: https://rubygems.org/
+  specs:
+    ast (2.4.3)
+    date (3.5.1)
+    erb (6.0.1.1)
+    ffi (1.17.4-arm64-darwin)
+    ffi (1.17.4-x86_64-darwin)
+    ffi (1.17.4-x86_64-linux-gnu)
+    fiddle (1.1.8)
+    io-console (0.8.2)
+    irb (1.16.0)
+      pp (>= 0.6.0)
+      rdoc (>= 4.0.0)
+      reline (>= 0.4.2)
+    json (2.18.0)
+    language_server-protocol (3.17.0.6)
+    lint_roller (1.1.0)
+    logger (1.7.0)
+    minitest (6.0.0)
+      prism (~> 1.5)
+    numo-narray (0.9.2.1)
+    onnxruntime (0.11.4-arm64-darwin)
+      ffi
+    onnxruntime (0.11.4-x86_64-darwin)
+      ffi
+    onnxruntime (0.11.4-x86_64-linux)
+      ffi
+    parallel (2.1.0)
+    parser (3.3.11.1)
+      ast (~> 2.4.1)
+      racc
+    pp (0.6.3)
+      prettyprint
+    prettyprint (0.2.0)
+    prism (1.8.1)
+    psych (5.3.1)
+      date
+      stringio
+    racc (1.8.1)
+    rainbow (3.1.1)
+    rake (13.3.1)
+    rbs (3.10.0)
+      logger
+    rdoc (7.0.4)
+      erb
+      psych (>= 4.0.0)
+      tsort
+    regexp_parser (2.12.0)
+    reline (0.6.3)
+      io-console (~> 0.5)
+    rubocop (1.88.2)
+      json (~> 2.3)
+      language_server-protocol (~> 3.17.0.2)
+      lint_roller (~> 1.1.0)
+      parallel (>= 1.10)
+      parser (>= 3.3.0.2)
+      rainbow (>= 2.2.2, < 4.0)
+      regexp_parser (>= 2.9.3, < 3.0)
+      rubocop-ast (>= 1.49.0, < 2.0)
+      ruby-progressbar (~> 1.7)
+      unicode-display_width (>= 2.4.0, < 4.0)
+    rubocop-ast (1.50.0)
+      parser (>= 3.3.7.2)
+      prism (~> 1.7)
+    ruby-progressbar (1.13.0)
+    stringio (3.2.0)
+    tsort (0.2.0)
+    unicode-display_width (3.2.0)
+      unicode-emoji (~> 4.1)
+    unicode-emoji (4.2.0)
+
+PLATFORMS
+  arm64-darwin
+  x86_64-darwin
+  x86_64-linux-gnu
+
+DEPENDENCIES
+  cohere-transcribe!
+  irb
+  minitest (>= 6.0, < 7)
+  rake (~> 13.0)
+  rbs (~> 3.10)
+  rubocop (~> 1.21)
+
+CHECKSUMS
+  ast (2.4.3) sha256=954615157c1d6a382bc27d690d973195e79db7f55e9765ac7c481c60bdb4d383
+  cohere-transcribe (0.1.0)
+  date (3.5.1) sha256=750d06384d7b9c15d562c76291407d89e368dda4d4fff957eb94962d325a0dc0
+  erb (6.0.1.1) sha256=ce5357460652a9a94667c5769eaffc551eea2b14a8531ac7c7b1d77b860758b9
+  ffi (1.17.4-arm64-darwin) sha256=19071aaf1419251b0a46852abf960e77330a3b334d13a4ab51d58b31a937001b
+  ffi (1.17.4-x86_64-darwin) sha256=aa70390523cf3235096cf64962b709b4cfbd5c082a2cb2ae714eb0fe2ccda496
+  ffi (1.17.4-x86_64-linux-gnu) sha256=9d3db14c2eae074b382fa9c083fe95aec6e0a1451da249eab096c34002bc752d
+  fiddle (1.1.8) sha256=7fa8ee3627271497f3add5503acdbc3f40b32f610fc1cf49634f083ef3f32eee
+  io-console (0.8.2) sha256=d6e3ae7a7cc7574f4b8893b4fca2162e57a825b223a177b7afa236c5ef9814cc
+  irb (1.16.0) sha256=2abe56c9ac947cdcb2f150572904ba798c1e93c890c256f8429981a7675b0806
+  json (2.18.0) sha256=b10506aee4183f5cf49e0efc48073d7b75843ce3782c68dbeb763351c08fd505
+  language_server-protocol (3.17.0.6) sha256=5ef2c0c138f8267e1bc631d3328347d354f96724b0af22f2c79516120443b7f0
+  lint_roller (1.1.0) sha256=2c0c845b632a7d172cb849cc90c1bce937a28c5c8ccccb50dfd46a485003cc87
+  logger (1.7.0) sha256=196edec7cc44b66cfb40f9755ce11b392f21f7967696af15d274dde7edff0203
+  minitest (6.0.0) sha256=4ca597fc1d735ea18d2b4b98c5fb1d5a6da4a6f35ddf32bd5fa3eded33a453be
+  numo-narray (0.9.2.1) sha256=eed76b47eebe1288ffd878b387f1882f4863d8e6ab5dd61453768139e14adceb
+  onnxruntime (0.11.4-arm64-darwin) sha256=1c5330a1f0adecf1f84edb1de2d3dc8fb599b681ff5deb7c9677640f1164d08e
+  onnxruntime (0.11.4-x86_64-darwin) sha256=10ad6306b6ca50cffe2c4a69518ba0bd496891bfbdb5f47fc664702ea583b98f
+  onnxruntime (0.11.4-x86_64-linux) sha256=1d63236a6a2dc5c596db45864b4d8f394033786a9566ba0a122c2ef8910d3006
+  parallel (2.1.0) sha256=b35258865c2e31134c5ecb708beaaf6772adf9d5efae28e93e99260877b09356
+  parser (3.3.11.1) sha256=d17ace7aabe3e72c3cc94043714be27cc6f852f104d81aa284c2281aecc65d54
+  pp (0.6.3) sha256=2951d514450b93ccfeb1df7d021cae0da16e0a7f95ee1e2273719669d0ab9df6
+  prettyprint (0.2.0) sha256=2bc9e15581a94742064a3cc8b0fb9d45aae3d03a1baa6ef80922627a0766f193
+  prism (1.8.1) sha256=b260c1844ee0c7ead9c938f7fd63b95888c87cc054dfb64043204eccff8116ac
+  psych (5.3.1) sha256=eb7a57cef10c9d70173ff74e739d843ac3b2c019a003de48447b2963d81b1974
+  racc (1.8.1) sha256=4a7f6929691dbec8b5209a0b373bc2614882b55fc5d2e447a21aaa691303d62f
+  rainbow (3.1.1) sha256=039491aa3a89f42efa1d6dec2fc4e62ede96eb6acd95e52f1ad581182b79bc6a
+  rake (13.3.1) sha256=8c9e89d09f66a26a01264e7e3480ec0607f0c497a861ef16063604b1b08eb19c
+  rbs (3.10.0) sha256=e75b5f1313c71c9ee0fcea68bf97d3e5fe8ec7a641d4b5cd18bbc28c94ddf298
+  rdoc (7.0.4) sha256=2b1c90011d6c6eab4c2fe5aa769d32285219047b2a97f489dc76242e8dff4f56
+  regexp_parser (2.12.0) sha256=35a916a1d63190ab5c9009457136ae5f3c0c7512d60291d0d1378ba18ce08ebb
+  reline (0.6.3) sha256=1198b04973565b36ec0f11542ab3f5cfeeec34823f4e54cebde90968092b1835
+  rubocop (1.88.2) sha256=8def251c90cd955feb4daa3edc0ab56893250c4ce90ef81e6c80c03f9a939bbf
+  rubocop-ast (1.50.0) sha256=b9ca88300da0803ee222ad20cdb30494c0a784eed06fdc35d254b06d662788db
+  ruby-progressbar (1.13.0) sha256=80fc9c47a9b640d6834e0dc7b3c94c9df37f08cb072b7761e4a71e22cff29b33
+  stringio (3.2.0) sha256=c37cb2e58b4ffbd33fe5cd948c05934af997b36e0b6ca6fdf43afa234cf222e1
+  tsort (0.2.0) sha256=9650a793f6859a43b6641671278f79cfead60ac714148aabe4e3f0060480089f
+  unicode-display_width (3.2.0) sha256=0cdd96b5681a5949cdbc2c55e7b420facae74c4aaf9a9815eee1087cb1853c42
+  unicode-emoji (4.2.0) sha256=519e69150f75652e40bf736106cfbc8f0f73aa3fb6a65afe62fefa7f80b0f80f
+
+BUNDLED WITH
+  4.0.16

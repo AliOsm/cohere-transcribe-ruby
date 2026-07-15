@@ -1,0 +1,49 @@
+name: Release Gem to RubyGems.org
+
+on:
+  release:
+    types:
+      - published
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-publish:
+    name: Build and Publish Package to RubyGems.org
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "4.0"
+          rubygems: latest
+
+      - name: Check release validity
+        run: sh .github/scripts/check-release.sh
+
+      - name: Build source gem
+        id: build
+        run: |
+          version=$(ruby -Ilib -rcohere/transcribe/version -e 'print Cohere::Transcribe::VERSION')
+          gem build cohere-transcribe.gemspec
+          gem_path="cohere-transcribe-${version}.gem"
+          test -f "$gem_path"
+          echo "gem_path=$gem_path" >> "$GITHUB_OUTPUT"
+
+      - name: Publish to RubyGems.org
+        env:
+          GEM_HOST_API_KEY: ${{ secrets.RUBYGEMS_AUTH_TOKEN }}
+        run: |
+          mkdir -p "$HOME/.gem"
+          credentials="$HOME/.gem/credentials"
+          printf '%s\n' '---' ":rubygems_api_key: ${GEM_HOST_API_KEY}" > "$credentials"
+          chmod 0600 "$credentials"
+          gem push "${{ steps.build.outputs.gem_path }}"

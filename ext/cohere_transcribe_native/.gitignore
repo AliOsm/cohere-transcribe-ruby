@@ -1,0 +1,6 @@
+/Makefile
+/build/
+/cuda-build/
+/stage/
+/cuda-stage/
+/mkmf.log

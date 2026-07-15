@@ -1,0 +1,71 @@
+AllCops:
+  TargetRubyVersion: 4.0
+  NewCops: enable
+
+# The runtime deliberately keeps validation and ABI state machines together;
+# line-count heuristics do not usefully measure those contracts.
+Metrics:
+  Enabled: false
+
+Style/Documentation:
+  Enabled: false
+
+Lint/DuplicateBranch:
+  Enabled: false
+
+Lint/RescueException:
+  Exclude:
+    - "lib/cohere/transcribe/api.rb"
+
+Lint/MissingSuper:
+  Exclude:
+    - "test/**/*.rb"
+
+Lint/FloatComparison:
+  Exclude:
+    - "test/**/*.rb"
+
+Lint/UnusedMethodArgument:
+  Exclude:
+    - "test/**/*.rb"
+
+# These preferences conflict with public exception constructors, compact test
+# namespaces, or deliberately explicit binary/format code.
+Lint/UselessMethodDefinition:
+  Enabled: false
+
+Style/RaiseArgs:
+  Enabled: false
+
+Style/NumericPredicate:
+  Enabled: false
+
+Style/IdenticalConditionalBranches:
+  Enabled: false
+
+Style/FormatStringToken:
+  Enabled: false
+
+Style/MultilineBlockChain:
+  Enabled: false
+
+Style/ClassAndModuleChildren:
+  Enabled: false
+
+Style/StringConcatenation:
+  Enabled: false
+
+Style/ComparableClamp:
+  Enabled: false
+
+Naming/VariableNumber:
+  Enabled: false
+
+Layout/LineLength:
+  Max: 140
+
+Style/StringLiterals:
+  EnforcedStyle: double_quotes
+
+Style/StringLiteralsInInterpolation:
+  EnforcedStyle: double_quotes

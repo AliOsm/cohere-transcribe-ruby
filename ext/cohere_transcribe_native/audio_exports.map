@@ -1,0 +1,10 @@
+{
+    global:
+        cohere_audio_ffmpeg_probe;
+        cohere_audio_ffmpeg_decode;
+        cohere_audio_ffmpeg_duration;
+        cohere_audio_ffmpeg_cancel;
+        cohere_audio_ffmpeg_free;
+    local:
+        *;
+};

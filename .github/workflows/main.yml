@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    name: Ruby ${{ matrix.ruby }} / ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+        ruby:
+          - "4.0"
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install Linux runtime packages
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ffmpeg libsndfile1 libsamplerate0
+
+      - name: Install macOS runtime packages
+        if: runner.os == 'macOS'
+        run: brew install cmake ffmpeg libsndfile libsamplerate
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ${{ matrix.ruby }}
+          rubygems: latest
+          bundler-cache: true
+
+      - name: Build and verify the native runtime
+        env:
+          COHERE_TRANSCRIBE_NATIVE_JOBS: "2"
+        run: |
+          ruby ext/cohere_transcribe_native/extconf.rb
+          make -C ext/cohere_transcribe_native check
+
+      - name: Run the default task
+        run: bundle exec rake
+
+      - name: Build the source gem
+        run: gem build cohere-transcribe.gemspec
