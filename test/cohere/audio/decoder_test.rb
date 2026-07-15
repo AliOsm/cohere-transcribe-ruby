@@ -36,6 +36,19 @@ module Cohere
           end
         end
 
+        def test_darwin_library_candidates_include_homebrew_and_macports
+          candidates = Audio.const_get(:SharedLibraryCandidates, false).build(
+            "COHERE_TRANSCRIBE_UNUSED_LIBRARY",
+            ["libexample.dylib"],
+            formula: "example",
+            host_os: "darwin"
+          )
+
+          assert_includes candidates, "/opt/homebrew/opt/example/lib/libexample.dylib"
+          assert_includes candidates, "/usr/local/opt/example/lib/libexample.dylib"
+          assert_includes candidates, "/opt/local/lib/libexample.dylib"
+        end
+
         def test_resamples_real_wav_through_libsamplerate
           with_wav(sample_rate: 8_000, channels: 2, frames: 800) do |path|
             decoded = Decoder.decode(path, sample_rate: SAMPLE_RATE, max_decoded_bytes: nil)

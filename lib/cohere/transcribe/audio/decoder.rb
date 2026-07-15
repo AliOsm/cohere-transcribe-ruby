@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "fiddle/import"
+require "rbconfig"
 
 require_relative "../constants"
 require_relative "../errors"
@@ -11,12 +12,38 @@ module Cohere
     module Audio
       Decoded = Data.define(:samples, :sample_rate, :backend, :fallback_reason)
 
+      module SharedLibraryCandidates
+        module_function
+
+        def build(environment_key, names, formula:, host_os: RbConfig::CONFIG.fetch("host_os"))
+          candidates = [ENV.fetch(environment_key, nil), *names].compact
+          return candidates.uniq unless host_os.match?(/darwin/)
+
+          directories = []
+          homebrew_prefix = ENV.fetch("HOMEBREW_PREFIX", nil)
+          directories << File.join(homebrew_prefix, "opt", formula, "lib") if homebrew_prefix && !homebrew_prefix.empty?
+          directories.push(
+            "/opt/homebrew/opt/#{formula}/lib",
+            "/usr/local/opt/#{formula}/lib",
+            "/opt/homebrew/lib",
+            "/usr/local/lib",
+            "/opt/local/lib"
+          )
+          candidates.concat(directories.product(names).map { |directory, name| File.join(directory, name) })
+          candidates.uniq
+        end
+      end
+      private_constant :SharedLibraryCandidates
+
       module SoundFileABI
         extend Fiddle::Importer
 
         begin
-          candidates = ([ENV.fetch("COHERE_TRANSCRIBE_SNDFILE_LIBRARY", nil)] +
-                        %w[libsndfile.so.1 libsndfile.so libsndfile.1.dylib libsndfile.dylib]).compact
+          candidates = SharedLibraryCandidates.build(
+            "COHERE_TRANSCRIBE_SNDFILE_LIBRARY",
+            %w[libsndfile.so.1 libsndfile.so libsndfile.1.dylib libsndfile.dylib],
+            formula: "libsndfile"
+          )
           library = candidates.find do |candidate|
             Fiddle.dlopen(candidate)
             true
@@ -50,8 +77,11 @@ module Cohere
         extend Fiddle::Importer
 
         begin
-          candidates = ([ENV.fetch("COHERE_TRANSCRIBE_SAMPLERATE_LIBRARY", nil)] +
-                        %w[libsamplerate.so.0 libsamplerate.so libsamplerate.0.dylib libsamplerate.dylib]).compact
+          candidates = SharedLibraryCandidates.build(
+            "COHERE_TRANSCRIBE_SAMPLERATE_LIBRARY",
+            %w[libsamplerate.so.0 libsamplerate.so libsamplerate.0.dylib libsamplerate.dylib],
+            formula: "libsamplerate"
+          )
           library = candidates.find do |candidate|
             Fiddle.dlopen(candidate)
             true

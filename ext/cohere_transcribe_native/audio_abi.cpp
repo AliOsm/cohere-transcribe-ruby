@@ -265,7 +265,35 @@ void* load_symbol(LibraryHandle handle, const char* name) {
 using LibraryHandle = void*;
 
 LibraryHandle open_library(const char* name) {
-    return dlopen(name, RTLD_NOW | RTLD_LOCAL);
+    LibraryHandle handle = dlopen(name, RTLD_NOW | RTLD_LOCAL);
+#if defined(__APPLE__)
+    if (handle || std::strchr(name, '/'))
+        return handle;
+
+    if (const char* homebrew_prefix = std::getenv("HOMEBREW_PREFIX")) {
+        if (*homebrew_prefix) {
+            const std::string path = std::string(homebrew_prefix) + "/opt/ffmpeg/lib/" + name;
+            handle = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+            if (handle)
+                return handle;
+        }
+    }
+
+    constexpr const char* kLibraryDirectories[] = {
+        "/opt/homebrew/opt/ffmpeg/lib/",
+        "/usr/local/opt/ffmpeg/lib/",
+        "/opt/homebrew/lib/",
+        "/usr/local/lib/",
+        "/opt/local/lib/",
+    };
+    for (const char* directory : kLibraryDirectories) {
+        const std::string path = std::string(directory) + name;
+        handle = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+        if (handle)
+            return handle;
+    }
+#endif
+    return handle;
 }
 
 void close_library(LibraryHandle handle) {

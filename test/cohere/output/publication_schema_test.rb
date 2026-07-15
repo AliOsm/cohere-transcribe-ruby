@@ -389,9 +389,10 @@ module Cohere
             options = options_with_publication.with(
               publication: options_with_publication.publication.with(output_dir: output_root)
             )
+            nested_output = output_root.realpath.join("nested")
             inserted = false
             operation_hook = lambda do |phase, candidate|
-              next unless phase == :before_mkdir && candidate == output_root.join("nested") && !inserted
+              next unless phase == :before_mkdir && candidate == nested_output && !inserted
 
               inserted = true
               candidate.make_symlink(outside)
