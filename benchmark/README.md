@@ -16,7 +16,7 @@ python benchmark/installed_gem_wer.py \
   --output-dir ../benchmark/results/installed_gem_ruby_010 \
   --run-name ruby_010_bf16_balanced500 \
   --gem-home /path/to/isolated/gem-home \
-  --gem-artifact ./cohere-transcribe-0.1.0.gem \
+  --gem-artifact ./cohere-transcribe-0.1.1.gem \
   --native-library /path/to/libcrispasr.so \
   --audio-library /path/to/libcohere_audio.so \
   --reference python_bf16=../benchmark/results/final_probe500_maskcache_20260711/bf16_length_b24_projcache_maskcache_repstop.hypotheses.jsonl

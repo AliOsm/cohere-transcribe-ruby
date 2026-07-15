@@ -71,7 +71,7 @@ makefile = <<~MAKEFILE
 
   all:
   \t#{Shellwords.join(configure)}
-  \t#{Shellwords.join(build)}
+  \t+#{Shellwords.join(build)}
   \t#{Shellwords.join(install)}
 
   install: all

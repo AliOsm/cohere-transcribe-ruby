@@ -254,7 +254,7 @@ Installed-gem WER measurements use the standalone runner documented in [`benchma
 
 ### Releasing
 
-Add a repository Actions secret named `RUBYGEMS_AUTH_TOKEN` containing a RubyGems API key with permission to push `cohere-transcribe`. Publishing a GitHub Release tagged `v0.1.0` runs the release workflow, verifies that the tag matches `Cohere::Transcribe::VERSION`, builds the exact `cohere-transcribe-0.1.0.gem` artifact, and pushes it to RubyGems.org.
+Add a repository Actions secret named `RUBYGEMS_AUTH_TOKEN` containing a RubyGems API key with permission to push `cohere-transcribe`. Publishing a GitHub Release tagged `v0.1.1` runs the release workflow, verifies that the tag matches `Cohere::Transcribe::VERSION`, builds the exact `cohere-transcribe-0.1.1.gem` artifact, and pushes it to RubyGems.org.
 
 Normal CI runs the Ruby suite, style checks, signature validation, native CPU build and ABI smoke checks, and source-gem build on Linux and macOS. It does not run the installed-gem WER or performance benchmarks.
 

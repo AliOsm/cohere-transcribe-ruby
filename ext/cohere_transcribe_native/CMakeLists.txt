@@ -106,12 +106,21 @@ if(COHERE_TRANSCRIBE_CUDA)
     # source path. Keep NVCC's per-file basename and give that path component a
     # stable identity shared by equivalent source trees.
     set(COHERE_TRANSCRIBE_CUDA_PREFIX_MAP_RESPONSE "cohere_cuda_prefix_map.rsp")
+    set(COHERE_TRANSCRIBE_CUDA_PREFIX_MAP_CONTENT
+        "\"${COHERE_TRANSCRIBE_SOURCE_PREFIX_MAP}\"\n\"${COHERE_TRANSCRIBE_BUILD_PREFIX_MAP}\"\n")
+    get_target_property(COHERE_TRANSCRIBE_CUDA_BINARY_DIR ggml-cuda BINARY_DIR)
     set(COHERE_TRANSCRIBE_CUDA_SOURCE_IDENTITY
         "/cohere-transcribe-source/vendor/crispasr/ggml/src/ggml-cuda")
     file(GENERATE
         OUTPUT "${CMAKE_BINARY_DIR}/${COHERE_TRANSCRIBE_CUDA_PREFIX_MAP_RESPONSE}"
-        CONTENT "\"${COHERE_TRANSCRIBE_SOURCE_PREFIX_MAP}\"\n\"${COHERE_TRANSCRIBE_BUILD_PREFIX_MAP}\"\n"
+        CONTENT "${COHERE_TRANSCRIBE_CUDA_PREFIX_MAP_CONTENT}"
     )
+    if(NOT COHERE_TRANSCRIBE_CUDA_BINARY_DIR STREQUAL CMAKE_BINARY_DIR)
+        file(GENERATE
+            OUTPUT "${COHERE_TRANSCRIBE_CUDA_BINARY_DIR}/${COHERE_TRANSCRIBE_CUDA_PREFIX_MAP_RESPONSE}"
+            CONTENT "${COHERE_TRANSCRIBE_CUDA_PREFIX_MAP_CONTENT}"
+        )
+    endif()
     target_compile_options(ggml-cuda PRIVATE
         "$<$<COMPILE_LANG_AND_ID:CUDA,NVIDIA>:-Xcompiler=@${COHERE_TRANSCRIBE_CUDA_PREFIX_MAP_RESPONSE}>"
         "$<$<COMPILE_LANG_AND_ID:CUDA,NVIDIA>:--objdir-as-tempdir>"

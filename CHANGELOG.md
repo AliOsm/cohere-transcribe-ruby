@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.1.1] - 2026-07-15
+
+- Fix CUDA source-gem installation across Unix Makefiles and Ninja by making NVCC's generated response file available from each compiler working directory, including when the gem is installed beneath a path containing spaces.
+- Preserve RubyGems build parallelism when the native extension delegates compilation to CMake.
+
 ## [0.1.0] - 2026-07-15
 
 - Release the independent Ruby gem with output schema 8 and profile schema 9.
