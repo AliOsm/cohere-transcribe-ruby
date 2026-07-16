@@ -254,10 +254,17 @@ module Cohere
       def test_binary_encoded_model_paths_are_accepted_locally_or_rejected_with_a_typed_error
         Dir.mktmpdir do |directory|
           binary_directory = File.join(directory.b, "model-\xE9".b)
-          Dir.mkdir(binary_directory)
           options = TranscriptionOptions.new(model: binary_directory)
-
-          assert_same options, Configuration.validate!(options)
+          begin
+            Dir.mkdir(binary_directory)
+          rescue Errno::EILSEQ
+            error = assert_raises(TranscriptionConfigurationError) do
+              Configuration.validate!(options)
+            end
+            assert_match(/Cannot resolve model path|valid Hugging Face repository ID or local directory/, error.message)
+          else
+            assert_same options, Configuration.validate!(options)
+          end
         end
 
         error = assert_raises(TranscriptionConfigurationError) do
