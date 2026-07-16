@@ -134,6 +134,29 @@ class Cohere::Transcribe::RuntimePreparationTest < Minitest::Test
     assert_operator limits.fetch(:small), :>=, 1
   end
 
+  def test_size_probes_are_limited_to_the_current_and_next_groups
+    estimated = []
+    pipeline = Pipeline.new(
+      (0...8).to_a,
+      memory_byte_limit: 1_000,
+      requested_workers: 2,
+      enabled: true,
+      estimate_bytes: lambda do |item|
+        estimated << item
+        10
+      end
+    ) { |item, _limit, _slot| item }
+
+    yielded = []
+    pipeline.each do |item|
+      yielded << item
+      assert_equal [0, 1, 2, 3], estimated if item.zero?
+    end
+
+    assert_equal (0...8).to_a, yielded
+    assert_equal (0...8).to_a, estimated
+  end
+
   def test_file_larger_than_the_group_cap_uses_the_full_budget_without_overlap
     started = []
     pipeline = Pipeline.new(
@@ -156,6 +179,82 @@ class Cohere::Transcribe::RuntimePreparationTest < Minitest::Test
     end
 
     assert_equal %i[before large after], yielded
+  end
+
+  def test_underestimated_group_is_retried_sequentially_with_the_full_budget
+    result = Data.define(:item, :error)
+    attempts = []
+    items = [[:first, 23], [:second, 23]]
+    pipeline = Pipeline.new(
+      items,
+      memory_byte_limit: 100,
+      requested_workers: 2,
+      enabled: true,
+      estimate_bytes: ->(item) { item.fetch(1) },
+      exclusive_retry: ->(entry) { entry.error == :estimated_limit }
+    ) do |item, limit, _slot|
+      attempts << [item.first, limit]
+      error = item.first == :first && limit < 26 ? :estimated_limit : nil
+      result.new(item: item.first, error: error)
+    end
+
+    yielded = pipeline.map { |entry| [entry.item, entry.error] }
+    first_limits = attempts.filter_map { |name, limit| limit if name == :first }
+    second_limits = attempts.filter_map { |name, limit| limit if name == :second }
+
+    assert_equal [[:first, nil], [:second, nil]], yielded
+    assert_equal [25, 100], first_limits
+    assert_equal [25, 100], second_limits
+  end
+
+  def test_unknown_sizes_share_an_ordinary_group_and_retry_on_the_worker_pool
+    result = Data.define(:item, :error)
+    attempts = []
+    caller = Thread.current
+    pipeline = Pipeline.new(
+      %i[first second],
+      memory_byte_limit: 100,
+      requested_workers: 2,
+      enabled: true,
+      estimate_bytes: ->(_item) {},
+      exclusive_retry: ->(entry) { entry.error == :estimated_limit }
+    ) do |item, limit, slot|
+      attempts << [item, limit, slot, Thread.current]
+      error = item == :first && limit < 100 ? :estimated_limit : nil
+      result.new(item: item, error: error)
+    end
+
+    yielded = pipeline.map { |entry| [entry.item, entry.error] }
+    first_attempts = attempts.select { |item,| item == :first }
+    second_attempts = attempts.select { |item,| item == :second }
+
+    assert_equal [[:first, nil], [:second, nil]], yielded
+    assert_equal([25, 100], first_attempts.map { |_item, limit,| limit })
+    assert_equal([25, 100], second_attempts.map { |_item, limit,| limit })
+    refute(attempts.any? { |_item, _limit, _slot, thread| thread.equal?(caller) })
+    assert_equal([0, 0], first_attempts.map { |_item, _limit, slot,| slot })
+    assert_equal([1, 0], second_attempts.map { |_item, _limit, slot,| slot })
+  end
+
+  def test_full_budget_exclusive_failure_is_not_retried
+    result = Data.define(:item, :error)
+    attempts = []
+    pipeline = Pipeline.new(
+      [[:large, 60]],
+      memory_byte_limit: 100,
+      requested_workers: 2,
+      enabled: true,
+      estimate_bytes: ->(item) { item.fetch(1) },
+      exclusive_retry: ->(entry) { entry.error == :estimated_limit }
+    ) do |item, limit, _slot|
+      attempts << [item.first, limit]
+      result.new(item: item.first, error: :estimated_limit)
+    end
+
+    yielded = pipeline.map { |entry| [entry.item, entry.error] }
+
+    assert_equal [%i[large estimated_limit]], yielded
+    assert_equal [[:large, 100]], attempts
   end
 
   def test_pipeline_reports_time_blocked_waiting_for_preparation

@@ -2,12 +2,12 @@
 
 require "digest"
 require "fileutils"
-require "tmpdir"
 
 module Cohere
   module Transcribe
     module State
       LOCK_DIRECTORY_PREFIX = "cohere-transcribe"
+      LOCK_DIRECTORY_NAME = "locks"
       LOCK_SUFFIX = ".lock"
 
       OutputLockTarget = Data.define(:path, :identity) do
@@ -118,8 +118,9 @@ module Cohere
       end
 
       def lock_registry_directory
-        scope = Process.respond_to?(:uid) ? Process.uid.to_s : Digest::SHA256.hexdigest(Dir.home)[0, 16]
-        Pathname(Dir.tmpdir).join("#{LOCK_DIRECTORY_PREFIX}-#{scope}")
+        cache_root = ENV["COHERE_TRANSCRIBE_CACHE"] ||
+                     File.join(ENV.fetch("XDG_CACHE_HOME", File.expand_path("~/.cache")), LOCK_DIRECTORY_PREFIX)
+        Pathname(cache_root).expand_path.join(LOCK_DIRECTORY_NAME)
       end
 
       def open_lock_file(path)
@@ -153,9 +154,7 @@ module Cohere
 
       def validate_lock_directory!(path)
         begin
-          Dir.mkdir(path, 0o700)
-        rescue Errno::EEXIST
-          nil
+          FileUtils.mkdir_p(path, mode: 0o700)
         rescue SystemCallError => e
           raise TranscriptionRuntimeError, "Cannot prepare output lock directory #{path}: #{e.message}"
         end

@@ -7,6 +7,12 @@ require "cohere/transcribe/types"
 class Cohere::Transcribe::TypesTest < Minitest::Test
   Types = Cohere::Transcribe
 
+  def test_public_output_formats_are_directly_accepted
+    assert_equal %w[txt srt vtt json], Cohere::Transcribe::OUTPUT_FORMATS
+    assert_equal Cohere::Transcribe::OUTPUT_FORMATS,
+                 Types::PublicationOptions.new(formats: Cohere::Transcribe::OUTPUT_FORMATS).formats
+  end
+
   def test_publication_options_defaults_normalization_and_paths
     defaults = Types::PublicationOptions.new
     assert_nil defaults.formats
@@ -35,6 +41,15 @@ class Cohere::Transcribe::TypesTest < Minitest::Test
     assert_equal Pathname("a/b"), normalized_paths.output_dir
     assert_equal Pathname("/"), normalized_paths.profile_json
     assert_equal Pathname("a/../b"), Types::PublicationOptions.new(output_dir: "a/../b").output_dir
+
+    byte_paths = Types::PublicationOptions.new(
+      output_dir: "transcripts-\xC3\xA9".b,
+      profile_json: "profile-\xC3\xA9.json".b
+    )
+    assert_equal Encoding::UTF_8, byte_paths.output_dir.to_s.encoding
+    assert_equal Encoding::UTF_8, byte_paths.profile_json.to_s.encoding
+    assert_equal "transcripts-é", byte_paths.output_dir.to_s
+    assert_equal "profile-é.json", byte_paths.profile_json.to_s
   end
 
   def test_publication_options_validate_formats_and_existing_policy
@@ -50,6 +65,16 @@ class Cohere::Transcribe::TypesTest < Minitest::Test
       Types::PublicationOptions.new(existing: "append")
     end
     assert_equal "existing must be 'error', 'overwrite', or 'skip'", error.message
+
+    error = assert_raises(ArgumentError) do
+      Types::PublicationOptions.new(output_dir: "transcripts-\xE9".b)
+    end
+    assert_equal "output_dir must contain valid UTF-8", error.message
+
+    error = assert_raises(ArgumentError) do
+      Types::PublicationOptions.new(profile_json: "profile-\xE9.json".b)
+    end
+    assert_equal "profile_json must contain valid UTF-8", error.message
   end
 
   def test_transcription_options_mirror_reference_defaults
@@ -105,6 +130,20 @@ class Cohere::Transcribe::TypesTest < Minitest::Test
     )
     assert options.frozen?
     assert_raises(NoMethodError) { options.language = "en" }
+  end
+
+  def test_model_and_adapter_references_normalize_valid_utf8_bytes
+    options = Types::TranscriptionOptions.new(
+      model: "owner/modèle".b,
+      model_revision: "révision".b,
+      adapter: "owner/adaptateur-é".b,
+      adapter_revision: "révision-adapter".b
+    )
+
+    %i[model model_revision adapter adapter_revision].each do |field|
+      assert_equal Encoding::UTF_8, options.public_send(field).encoding
+      assert_predicate options.public_send(field), :valid_encoding?
+    end
   end
 
   def test_all_result_value_objects_expose_the_reference_fields

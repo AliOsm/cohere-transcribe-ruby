@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require "English"
 require_relative "lib/cohere/transcribe/version"
 
 Gem::Specification.new do |spec|
@@ -24,15 +25,29 @@ Gem::Specification.new do |spec|
   spec.metadata["rubygems_mfa_required"] = "true"
 
   spec.files = Dir.chdir(__dir__) do
-    Dir[
+    files = Dir[
       "CHANGELOG.md", "LICENSE.txt", "NOTICE", "README.md", "THIRD_PARTY_NOTICES.md",
       "exe/*", "ext/**/*", "lib/**/*", "licenses/**/*", "sig/**/*", "vendor/**/*"
-    ].select { |path| File.file?(path) }
-     .reject do |path|
-       path == "ext/cohere_transcribe_native/Makefile" ||
-         path.start_with?("lib/cohere/transcribe/native/") ||
-         path.end_with?(".py", ".pyc")
-     end
+    ]
+    if File.exist?(".git")
+      begin
+        tracked = IO.popen(["git", "-C", __dir__, "ls-files", "-z"], "rb", &:read)
+        files = tracked.split("\0") if $CHILD_STATUS.success?
+      rescue Errno::ENOENT
+        nil
+      end
+    end
+    files.select { |path| File.file?(path) }
+         .select do |path|
+           path.match?(/\A(?:CHANGELOG\.md|LICENSE\.txt|NOTICE|README\.md|THIRD_PARTY_NOTICES\.md)\z/) ||
+             path.match?(%r{\A(?:exe|ext|lib|licenses|sig|vendor)/})
+         end
+         .reject do |path|
+           path == "ext/cohere_transcribe_native/Makefile" ||
+             path.start_with?("lib/cohere/transcribe/native/") ||
+             path.end_with?(".py", ".pyc") ||
+             path.match?(%r{\Aext/[^/]+/(?:build|cuda-build|stage|cuda-stage)/})
+         end
   end
   spec.bindir = "exe"
   spec.executables = spec.files.grep(%r{\Aexe/}) { |f| File.basename(f) }

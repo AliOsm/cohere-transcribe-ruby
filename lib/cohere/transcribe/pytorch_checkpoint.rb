@@ -184,8 +184,8 @@ module Cohere
                          total_entries == ZIP64_UINT16_MARKER ||
                          central_size == ZIP64_UINT32_MARKER ||
                          central_offset == ZIP64_UINT32_MARKER
-          total_entries, central_size, central_offset = zip64_directory(eocd_offset) if
-            zip64_marker && zip64_locator_present?(eocd_offset)
+          zip64_values = zip64_directory(eocd_offset) if zip64_marker
+          total_entries, central_size, central_offset = zip64_values if zip64_values
           if total_entries > ZIP_ENTRY_LIMIT || central_size > ZIP_CENTRAL_LIMIT ||
              central_size > size || central_offset > size - central_size
             raise Error, "PyTorch archive #{path} has invalid central-directory bounds"
@@ -204,11 +204,12 @@ module Cohere
         end
 
         def zip64_directory(eocd_offset)
-          raise Error, "PyTorch archive #{path} has no ZIP64 locator" if eocd_offset < 20
+          return if eocd_offset < 20
 
           locator = read_range(eocd_offset - 20, 20)
           signature, disk, record_offset, disks = locator.unpack("VVQ<V")
-          raise Error, "PyTorch archive #{path} has an invalid ZIP64 locator" unless signature == ZIP64_LOCATOR && disk.zero? && disks == 1
+          return unless signature == ZIP64_LOCATOR
+          raise Error, "PyTorch archive #{path} has an invalid ZIP64 locator" unless disk.zero? && disks == 1
 
           record = read_range(record_offset, 56)
           signature, record_size, _made, _needed, disk, central_disk,
@@ -219,12 +220,6 @@ module Cohere
           end
 
           [total_entries, central_size, central_offset]
-        end
-
-        def zip64_locator_present?(eocd_offset)
-          return false if eocd_offset < 20
-
-          read_range(eocd_offset - 20, 4).unpack1("V") == ZIP64_LOCATOR
         end
 
         def parse_central_directory(bytes, expected_entries:, archive_size:, data_limit:)
@@ -783,7 +778,6 @@ module Cohere
           @path = Pathname(path).expand_path
           @storages = {}
           @storage_payloads = {}
-          @verified_storage_payloads = {}
           @storage_verification_mutex = Mutex.new
           @tensors = read_checkpoint.freeze
         end
@@ -812,37 +806,47 @@ module Cohere
           end
           raise ArgumentError, "chunk_bytes must be positive" unless chunk_bytes.positive?
 
-          verify_storage_payload!(tensor)
-
           source_width = Safetensors::DTYPE_BYTES.fetch(tensor.dtype)
           elements_per_chunk = [chunk_bytes / source_width, 1].max
           bytes_per_chunk = elements_per_chunk * source_width
           unless contiguous?(tensor)
+            verify_storage_payload!(tensor)
             return write_strided_tensor(
               tensor, output, target_dtype: target_dtype, converter: converter,
                               elements_per_chunk: elements_per_chunk, source_width: source_width
             )
           end
 
+          inline_payload, output_start = inline_storage_verification(tensor, output)
+          verify_storage_payload!(tensor) unless inline_payload
           remaining = tensor.nbytes
           written = 0
-          File.open(path, "rb") do |source|
-            source.seek(tensor.data_start)
-            while remaining.positive?
-              requested = [remaining, bytes_per_chunk].min
-              chunk = source.read(requested)
-              raise Error, "Unexpected end of #{path} while reading #{tensor.name.inspect}" if chunk.nil? || chunk.bytesize != requested
+          crc32 = 0 if inline_payload
+          completed = false
+          begin
+            File.open(path, "rb") do |source|
+              source.seek(tensor.data_start)
+              while remaining.positive?
+                requested = [remaining, bytes_per_chunk].min
+                chunk = source.read(requested)
+                raise Error, "Unexpected end of #{path} while reading #{tensor.name.inspect}" if chunk.nil? || chunk.bytesize != requested
 
-              converted = converter.convert(chunk, from: tensor.dtype, to: target_dtype)
-              output.write(converted)
-              written += converted.bytesize
-              remaining -= requested
+                crc32 = Zlib.crc32(chunk, crc32) if inline_payload
+                converted = converter.convert(chunk, from: tensor.dtype, to: target_dtype)
+                output.write(converted)
+                written += converted.bytesize
+                remaining -= requested
+              end
             end
-          end
-          expected = tensor.element_count * Safetensors::DTYPE_BYTES.fetch(target_dtype)
-          return written if written == expected
+            mark_inline_storage_verified!(tensor.storage_key, inline_payload, crc32) if inline_payload
+            expected = tensor.element_count * Safetensors::DTYPE_BYTES.fetch(target_dtype)
+            raise Error, "Converted tensor #{tensor.name.inspect} wrote #{written} bytes; expected #{expected}" unless written == expected
 
-          raise Error, "Converted tensor #{tensor.name.inspect} wrote #{written} bytes; expected #{expected}"
+            completed = true
+            written
+          ensure
+            rollback_inline_output(output, output_start) if output_start && !completed
+          end
         end
 
         private
@@ -1036,15 +1040,43 @@ module Cohere
         end
 
         def verify_storage_payload!(tensor)
-          payload = @storage_payloads[tensor.storage_key]
-          return unless payload
-
           @storage_verification_mutex.synchronize do
-            return if @verified_storage_payloads.key?(tensor.storage_key)
+            payload = @storage_payloads[tensor.storage_key]
+            return unless payload
 
             verify_storage_crc!(tensor.storage_key, payload)
-            @verified_storage_payloads[tensor.storage_key] = true
+            @storage_payloads.delete(tensor.storage_key)
           end
+        end
+
+        def inline_storage_verification(tensor, output)
+          return [nil, nil] unless output.respond_to?(:pos) && output.respond_to?(:truncate) && output.respond_to?(:seek)
+
+          payload = @storage_verification_mutex.synchronize do
+            @storage_payloads[tensor.storage_key]
+          end
+          return [nil, nil] unless payload && tensor.data_start == payload.data_offset && tensor.nbytes == payload.size
+
+          position = Integer(output.pos)
+          return [nil, nil] if position.negative?
+
+          [payload, position]
+        rescue ArgumentError, TypeError, SystemCallError
+          [nil, nil]
+        end
+
+        def mark_inline_storage_verified!(storage_key, payload, crc32)
+          verify_storage_crc_value!(storage_key, payload, crc32)
+          @storage_verification_mutex.synchronize do
+            @storage_payloads.delete(storage_key) if @storage_payloads[storage_key].equal?(payload)
+          end
+        end
+
+        def rollback_inline_output(output, position)
+          output.truncate(position)
+          output.seek(position)
+        rescue StandardError
+          nil
         end
 
         def verify_storage_crc!(storage_key, payload)
@@ -1063,11 +1095,15 @@ module Cohere
               remaining -= requested
             end
           end
+          verify_storage_crc_value!(storage_key, payload, crc32)
+        rescue Errno::ENOENT, Errno::EACCES => e
+          raise Error, "Cannot read PyTorch checkpoint #{path}: #{e.message}"
+        end
+
+        def verify_storage_crc_value!(storage_key, payload, crc32)
           return if crc32 == payload.crc32
 
           raise Error, "PyTorch tensor storage #{storage_key.inspect} failed its CRC check"
-        rescue Errno::ENOENT, Errno::EACCES => e
-          raise Error, "Cannot read PyTorch checkpoint #{path}: #{e.message}"
         end
 
         # General strided tensors occur in legitimate torch state dictionaries

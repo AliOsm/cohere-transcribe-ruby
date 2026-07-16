@@ -201,6 +201,26 @@ class Cohere::Transcribe::CLITest < Minitest::Test
     assert options.stop_repetition_loops
   end
 
+  def test_enum_values_require_an_exact_choice
+    {
+      "--language" => "e",
+      "--existing" => "o",
+      "--device" => "c",
+      "--dtype" => "fp",
+      "--audio-backend" => "ff",
+      "--vad" => "n",
+      "--vad-engine" => "on",
+      "--truncation-policy" => "r",
+      "--alignment" => "w",
+      "--align-dtype" => "fp"
+    }.each do |option, value|
+      error = assert_raises(OptionParser::InvalidArgument, option) do
+        CLI.parse_args(["audio.wav", option, value])
+      end
+      assert_includes error.message, "invalid choice"
+    end
+  end
+
   def test_formats_use_reference_whitespace_separation_and_reject_commas
     command = CLI.parse_args(%w[audio.wav --formats json txt json])
     assert_equal %w[json txt], command.options.publication.formats

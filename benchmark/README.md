@@ -13,10 +13,10 @@ Example balanced-500 command:
 ```bash
 python benchmark/installed_gem_wer.py \
   ../benchmark/manifests/wit_probe500.jsonl \
-  --output-dir ../benchmark/results/installed_gem_ruby_012 \
-  --run-name ruby_012_bf16_balanced500 \
+  --output-dir ../benchmark/results/installed_gem_ruby_013 \
+  --run-name ruby_013_bf16_balanced500 \
   --gem-home /path/to/isolated/gem-home \
-  --gem-artifact ./cohere-transcribe-0.1.2.gem \
+  --gem-artifact ./cohere-transcribe-0.1.3.gem \
   --native-library /path/to/libcrispasr.so \
   --audio-library /path/to/libcohere_audio.so \
   --reference python_bf16=../benchmark/results/final_probe500_maskcache_20260711/bf16_length_b24_projcache_maskcache_repstop.hypotheses.jsonl

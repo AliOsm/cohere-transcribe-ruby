@@ -1381,6 +1381,46 @@ class Cohere::Transcribe::RuntimeEngineTest < Minitest::Test
     end
   end
 
+  def test_underestimated_decodes_retry_sequentially_with_the_full_pcm_budget
+    with_audio_files(2) do |paths|
+      calls = []
+      decoder = Object.new
+      decoder.define_singleton_method(:estimate_decoded_bytes) { |_path, **| 230 * (1024**2) }
+      decoder.define_singleton_method(:decode) do |path, max_decoded_bytes:, **|
+        calls << [File.basename(path.to_s), max_decoded_bytes, Thread.current]
+        if max_decoded_bytes < 300 * (1024**2)
+          raise Cohere::Transcribe::Audio::DecodedAudioLimitError, "metadata underestimated decoded audio"
+        end
+
+        Cohere::Transcribe::Audio::Decoded.new(
+          samples: Array.new(16_000, 0.1),
+          sample_rate: 16_000,
+          backend: "fake",
+          fallback_reason: nil
+        )
+      end
+      engine = Cohere::Transcribe::Runtime::Engine.new(
+        base_options.with(audio_memory_gb: 1.0, preprocess_workers: 2, pipeline_preparation: true),
+        model_provider: FakeProvider.new,
+        decoder: decoder
+      )
+
+      run = engine.transcribe(paths)
+
+      assert run.ok?
+      calls_by_path = calls.group_by(&:first)
+      paths.each do |path|
+        limits = calls_by_path.fetch(File.basename(path)).map { |call| call.fetch(1) }
+        assert_equal [256 * (1024**2), 1024**3], limits
+      end
+      retry_threads = calls.select { |call| call.fetch(1) == 1024**3 }.map { |call| call.fetch(2) }
+      refute(retry_threads.any? { |thread| thread.equal?(Thread.current) })
+      assert_equal 1, retry_threads.uniq.length
+    ensure
+      engine&.close
+    end
+  end
+
   def test_progress_abort_cancels_next_group_workers_and_evicts_the_session
     with_audio_files(4) do |paths|
       workers = [2, Etc.nprocessors].min

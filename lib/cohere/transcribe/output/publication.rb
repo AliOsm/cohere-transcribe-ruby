@@ -1021,15 +1021,6 @@ module Cohere
         end
         private_class_method :bound_output_mode
 
-        def output_mode(destination)
-          return destination.stat.mode & 0o7777 if destination.exist?
-
-          current_umask = File.umask
-          File.umask(current_umask)
-          0o666 & ~current_umask
-        end
-        private_class_method :output_mode
-
         def fsync_directories(directories)
           directories.each do |directory|
             File.open(directory, File::RDONLY, &:fsync)
@@ -1039,17 +1030,6 @@ module Cohere
           end
         end
         private_class_method :fsync_directories
-
-        def verified_publication?(source_snapshot, paths, state_path, options)
-          State.verify_published_outputs(
-            source_snapshot: source_snapshot,
-            output_paths: paths,
-            state_path: state_path,
-            asr_contract_key: State.asr_contract_key(options),
-            render_contract_key: State.render_contract_key(options)
-          ).verified?
-        end
-        private_class_method :verified_publication?
 
         def source_record(path)
           State::SourceSnapshot.capture(path)

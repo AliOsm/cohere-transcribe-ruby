@@ -9,6 +9,6 @@ module Cohere
       .aac .aif .aiff .alac .flac .m4a .mp3 .mp4 .oga .ogg .opus .wav .wave
       .webm .wma
     ].freeze
-    OUTPUT_FORMATS = %i[txt srt vtt json].freeze
+    OUTPUT_FORMATS = %w[txt srt vtt json].freeze
   end
 end

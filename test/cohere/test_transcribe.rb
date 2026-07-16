@@ -52,7 +52,7 @@ class Cohere::TestTranscribe < Minitest::Test
 
   def test_that_it_has_a_version_number
     refute_nil ::Cohere::Transcribe::VERSION
-    assert_equal "0.1.2", ::Cohere::Transcribe::VERSION
+    assert_equal "0.1.3", ::Cohere::Transcribe::VERSION
   end
 
   def test_public_transcriber_is_lazy_reusable_and_closable

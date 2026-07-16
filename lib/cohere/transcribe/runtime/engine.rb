@@ -264,7 +264,10 @@ module Cohere
             requested_workers: resolved_options.preprocess_workers,
             enabled: resolved_options.pipeline_preparation,
             worker_limit: vad_file_concurrency_limit(resolved_options),
-            estimate_bytes: estimate_bytes
+            estimate_bytes: estimate_bytes,
+            exclusive_retry: lambda do |prepared|
+              prepared.error.is_a?(Audio::DecodedAudioLimitError)
+            end
           ) do |item, decoded_byte_limit, worker_slot|
             prepare_entry(
               item,

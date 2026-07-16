@@ -34,14 +34,21 @@ module Cohere
         assert normalized.first.frozen?
       end
 
-      def test_binary_encoded_unix_paths_are_preserved_and_fail_through_typed_errors
-        path = "/tmp/caf\xE9.wav".b
+      def test_binary_encoded_utf8_paths_are_preserved_as_utf8_text
+        path = "/tmp/caf\xC3\xA9.wav".b
         normalized = Input.normalize(path)
 
-        assert_equal [path], normalized
-        assert_equal Encoding::ASCII_8BIT, normalized.first.encoding
-        error = assert_raises(TranscriptionInputError) { Input.expand(path) }
-        assert_match(/does not exist/, error.message)
+        assert_equal path.bytes, normalized.first.bytes
+        assert_equal Encoding::UTF_8, normalized.first.encoding
+        assert normalized.first.valid_encoding?
+      end
+
+      def test_non_utf8_byte_paths_are_rejected_before_file_access
+        path = "/tmp/caf\xE9.wav".b
+
+        error = assert_raises(TranscriptionInputError) { Input.normalize(path) }
+
+        assert_equal "audio path must contain valid UTF-8", error.message
       end
 
       def test_normalize_rejects_ambiguous_and_invalid_values
@@ -169,6 +176,38 @@ module Cohere
 
           entries = Input.expand([source, alias_path, root])
           assert_equal(["real.wav"], entries.map { |entry| entry.relative_path.to_s })
+        end
+      end
+
+      def test_expansion_rejects_a_valid_alias_to_a_non_utf8_target
+        Dir.mktmpdir do |directory|
+          target = File.join(directory.b, "target-\xE9.wav".b)
+          alias_path = File.join(directory, "alias.wav")
+          begin
+            File.binwrite(target, "audio")
+            File.symlink(File.basename(target), alias_path)
+          rescue NotImplementedError, Errno::EILSEQ, Errno::EPERM
+            skip "this filesystem cannot create the fixture path"
+          end
+
+          error = assert_raises(TranscriptionInputError) { Input.expand(alias_path) }
+
+          assert_match(/resolved input path must contain valid UTF-8/, error.message)
+        end
+      end
+
+      def test_directory_expansion_rejects_non_utf8_audio_entries
+        Dir.mktmpdir do |directory|
+          path = File.join(directory.b, "clip-\xE9.wav".b)
+          begin
+            File.binwrite(path, "audio")
+          rescue Errno::EILSEQ
+            skip "this filesystem cannot create the fixture path"
+          end
+
+          error = assert_raises(TranscriptionInputError) { Input.expand(directory) }
+
+          assert_match(/valid UTF-8/, error.message)
         end
       end
 

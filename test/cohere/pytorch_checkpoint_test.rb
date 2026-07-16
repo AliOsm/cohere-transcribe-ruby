@@ -107,6 +107,86 @@ class PyTorchCheckpointTest < Minitest::Test
     end
   end
 
+  def test_full_contiguous_zip_storage_combines_crc_with_conversion
+    Dir.mktmpdir do |directory|
+      path = File.join(directory, "pytorch_model.bin")
+      tensors = {
+        "flat" => tensor(dtype: "F32", key: "0", shape: [6], stride: [1], elements: 6)
+      }
+      write_zip_checkpoint(path, tensors, "0" => (0..5).map(&:to_f).pack("e*"))
+      reader = Checkpoint::Reader.new(path)
+      separate_checks = []
+      probe = Module.new do
+        define_method(:verify_storage_crc!) do |storage_key, payload|
+          separate_checks << storage_key
+          super(storage_key, payload)
+        end
+      end
+      reader.singleton_class.prepend(probe)
+      output = StringIO.new(+"prefix".b)
+      output.seek(0, IO::SEEK_END)
+
+      reader.write_tensor(reader.fetch("flat"), output, target_dtype: "F32", chunk_bytes: 5)
+
+      assert_empty separate_checks
+      assert_equal "prefix".b, output.string.byteslice(0, 6)
+      assert_equal (0..5).map(&:to_f), output.string.byteslice(6..).unpack("e*")
+    end
+  end
+
+  def test_inline_crc_completion_is_reused_by_other_views_of_the_storage
+    Dir.mktmpdir do |directory|
+      path = File.join(directory, "pytorch_model.bin")
+      tensors = {
+        "flat" => tensor(dtype: "F32", key: "0", shape: [6], stride: [1], elements: 6),
+        "matrix" => tensor(dtype: "F32", key: "0", shape: [3, 2], stride: [1, 3], elements: 6)
+      }
+      write_zip_checkpoint(path, tensors, "0" => (0..5).map(&:to_f).pack("e*"))
+      reader = Checkpoint::Reader.new(path)
+      separate_checks = []
+      probe = Module.new do
+        define_method(:verify_storage_crc!) do |storage_key, payload|
+          separate_checks << storage_key
+          super(storage_key, payload)
+        end
+      end
+      reader.singleton_class.prepend(probe)
+
+      flat = StringIO.new(+"".b)
+      matrix = StringIO.new(+"".b)
+      reader.write_tensor(reader.fetch("flat"), flat, target_dtype: "F32", chunk_bytes: 5)
+      reader.write_tensor(reader.fetch("matrix"), matrix, target_dtype: "F32", chunk_bytes: 5)
+
+      assert_empty separate_checks
+      assert_equal (0..5).map(&:to_f), flat.string.unpack("e*")
+      assert_equal [0.0, 3.0, 1.0, 4.0, 2.0, 5.0], matrix.string.unpack("e*")
+    end
+  end
+
+  def test_inline_crc_failure_rolls_back_a_seekable_output
+    Dir.mktmpdir do |directory|
+      path = File.join(directory, "pytorch_model.bin")
+      tensors = {
+        "flat" => tensor(dtype: "F32", key: "0", shape: [4], stride: [1], elements: 4)
+      }
+      write_zip_checkpoint(path, tensors, "0" => [1.0, 2.0, 3.0, 4.0].pack("e*"))
+      reader = Checkpoint::Reader.new(path)
+      flip_byte(path, reader.fetch("flat").storage_data_start + 12)
+      output = StringIO.new(+"prefix".b)
+      output.seek(0, IO::SEEK_END)
+
+      2.times do
+        error = assert_raises(Checkpoint::Error) do
+          reader.write_tensor(reader.fetch("flat"), output, target_dtype: "F32")
+        end
+
+        assert_match(/storage "0" failed its CRC check/, error.message)
+        assert_equal "prefix".b, output.string
+        assert_equal 6, output.pos
+      end
+    end
+  end
+
   def test_reads_legacy_pickle_and_raw_storage_stream_without_executing_python
     Dir.mktmpdir do |directory|
       path = File.join(directory, "pytorch_model.bin")
@@ -190,11 +270,29 @@ class PyTorchCheckpointTest < Minitest::Test
     Dir.mktmpdir do |directory|
       path = File.join(directory, "zip64.bin")
       write_zip64(path, "archive/data.pkl", proto + "}.")
+      locator_offset = File.binread(path).index([Checkpoint::ZIP64_LOCATOR].pack("V"))
+      archive_class = Class.new(Checkpoint::ZipArchive) do
+        attr_reader :read_ranges
 
-      archive = Checkpoint::ZipArchive.new(path)
+        def initialize(...)
+          @read_ranges = []
+          super
+        end
+
+        private
+
+        def read_range(offset, length)
+          @read_ranges << [offset, length]
+          super
+        end
+      end
+
+      archive = archive_class.new(path)
 
       assert_equal ["archive/data.pkl"], archive.entries.keys
       assert_equal proto + "}.", archive.read("archive/data.pkl")
+      locator_reads = archive.read_ranges.select { |offset, _length| offset == locator_offset }
+      assert_equal [[locator_offset, 20]], locator_reads
     end
   end
 
@@ -226,9 +324,18 @@ class PyTorchCheckpointTest < Minitest::Test
     end
   end
 
-  def test_locator_present_zip64_still_rejects_a_malformed_end_record
+  def test_zip64_rejects_a_malformed_locator_and_end_record
     Dir.mktmpdir do |directory|
       path = File.join(directory, "malformed-zip64.bin")
+      write_zip64(path, "archive/data.pkl", proto + "}.")
+      bytes = File.binread(path)
+      locator = bytes.index([Checkpoint::ZIP64_LOCATOR].pack("V"))
+      bytes[locator + 4, 4] = [1].pack("V")
+      File.binwrite(path, bytes)
+
+      error = assert_raises(Checkpoint::Error) { Checkpoint::ZipArchive.new(path) }
+      assert_match(/invalid ZIP64 locator/, error.message)
+
       write_zip64(path, "archive/data.pkl", proto + "}.")
       bytes = File.binread(path)
       locator = bytes.index([Checkpoint::ZIP64_LOCATOR].pack("V"))

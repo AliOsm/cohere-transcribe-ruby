@@ -72,10 +72,17 @@ module Cohere
         )
         return PublicationVerification.new(verified: false, generation_id: nil, reason: mismatch.freeze) if mismatch
 
+        verify_publication_bindings!(directory_binding, guard_bindings)
         PublicationVerification.new(
           verified: true,
           generation_id: payload.fetch("generation_id").dup.freeze,
           reason: nil
+        )
+      rescue PublicationDirectoryChangedError => e
+        PublicationVerification.new(
+          verified: false,
+          generation_id: nil,
+          reason: "publication parent changed during verification (#{e.message})".freeze
         )
       rescue EncodingError, SystemCallError, TypeError, ArgumentError => e
         PublicationVerification.new(
@@ -140,18 +147,14 @@ module Cohere
             Thread.handle_interrupt(DEFERRED_PUBLICATION_EXCEPTIONS) do
               handle = bound.open_regular(basename)
             end
-          rescue TranscriptionRuntimeError
+          rescue PublicationEntryError
             bound.verify!
             return nil
           end
           opened = handle.stat
           digest = Digest::SHA256.new
           digest << handle.read(1024 * 1024) until handle.eof?
-          unchanged = begin
-            bound.same_regular_entry?(basename, opened)
-          rescue TranscriptionRuntimeError
-            false
-          end
+          unchanged = bound.same_regular_entry?(basename, opened)
           unless unchanged
             bound.verify!
             return nil
@@ -164,6 +167,11 @@ module Cohere
         end
       end
       private_class_method :bound_output_record
+
+      def verify_publication_bindings!(directory_binding, guard_bindings)
+        (Array(guard_bindings).compact + [directory_binding].compact).uniq.each(&:verify!)
+      end
+      private_class_method :verify_publication_bindings!
     end
   end
 end

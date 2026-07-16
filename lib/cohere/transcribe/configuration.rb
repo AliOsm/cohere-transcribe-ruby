@@ -200,6 +200,7 @@ module Cohere
         text = value.is_a?(String) ? value : value.to_path
         raise TypeError, "#{description} path must resolve to text" unless text.is_a?(String)
 
+        text = validated_utf8_text(text, option)
         stripped = PythonText.strip(text)
         invalid!("#{option} must be a non-empty Hugging Face repository ID or local directory") if stripped.empty?
         invalid!("#{option} must not have leading or trailing whitespace") unless text == stripped
@@ -228,12 +229,23 @@ module Cohere
         return if value.nil?
 
         if value.is_a?(String)
+          value = validated_utf8_text(value, option)
           stripped = PythonText.strip(value)
           return if !stripped.empty? && value == stripped
         end
 
         invalid!("#{option} must be a non-empty revision without surrounding whitespace")
       end
+
+      private_class_method :validate_revision!
+
+      def validated_utf8_text(value, option)
+        text = value.b.dup.force_encoding(Encoding::UTF_8)
+        invalid!("#{option} must contain valid UTF-8") unless text.valid_encoding?
+
+        text
+      end
+      private_class_method :validated_utf8_text
 
       def valid_repository_id?(value)
         return false if value.count("/") > 1 || value.include?("--") || value.include?("..") || value.end_with?(".git")

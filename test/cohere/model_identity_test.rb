@@ -248,6 +248,31 @@ class Cohere::Transcribe::ModelIdentityTest < Minitest::Test
                  ModelIdentity.resolve_local_directory("././~", description: "Model")
   end
 
+  def test_local_model_and_adapter_aliases_require_utf8_canonical_paths
+    Dir.mktmpdir do |directory|
+      invalid_directory = File.join(directory.b, "checkpoint-\xE9".b)
+      begin
+        Dir.mkdir(invalid_directory)
+      rescue Errno::EILSEQ
+        skip "this filesystem cannot create the fixture path"
+      end
+
+      %w[Model Adapter].each do |description|
+        alias_path = File.join(directory, "#{description.downcase}-alias")
+        begin
+          File.symlink(File.basename(invalid_directory), alias_path)
+        rescue NotImplementedError, Errno::EPERM
+          skip "symbolic links are unavailable"
+        end
+
+        error = assert_raises(ArgumentError) do
+          ModelIdentity.resolve_local_directory(alias_path, description: description)
+        end
+        assert_equal "#{description} resolved path must contain valid UTF-8", error.message
+      end
+    end
+  end
+
   def test_architectures_mirror_python_truthiness_and_membership
     target = "CohereAsrForConditionalGeneration"
     accepted = [nil, false, 0, 0.0, "", [], {}, target, "prefix-#{target}-suffix", [target], { target => false }]

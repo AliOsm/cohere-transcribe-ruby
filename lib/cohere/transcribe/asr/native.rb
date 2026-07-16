@@ -4,6 +4,8 @@ require "etc"
 require "fiddle"
 require "rbconfig"
 require_relative "../errors"
+require_relative "../internal/interruptible_native_call"
+require_relative "../internal/session_ownership"
 require_relative "../python_text"
 require_relative "failure_policy"
 
@@ -297,49 +299,14 @@ module Cohere
           4 => :error
         }.freeze
 
-        # Keeps the native pointer independently of the Ruby session wrapper so
-        # ObjectSpace cleanup never retains the object it is meant to collect.
-        # Taking the pointer before calling the foreign close function makes
-        # explicit close, constructor rollback, and finalization idempotent.
-        class SessionOwnership
-          def initialize(library)
-            @library = library
-            @mutex = Mutex.new
-            @session = nil
-          end
-
-          def install(session)
-            @mutex.synchronize do
-              raise TranscriptionRuntimeError, "Native session ownership is already installed" if @session
-
-              @session = session
-            end
-          end
-
-          def close
-            session = @mutex.synchronize do
-              current = @session
-              @session = nil
-              current
-            end
-            return unless session
-
-            @library.call(:session_close, session)
-            nil
-          end
-
-          def finalize
-            close
-          rescue Exception # rubocop:disable Lint/RescueException -- finalizers must not escape during GC or shutdown
-            nil
+        # A callable retained by detached ownership state. It keeps the native
+        # library alive, but never captures the NativeSession being finalized.
+        NativeSessionCloser = Data.define(:library) do
+          def call(session)
+            library.call(:session_close, session)
           end
         end
-        private_constant :SessionOwnership
-
-        def self.finalizer_for(ownership)
-          proc { |_object_id| ownership.finalize }
-        end
-        private_class_method :finalizer_for
+        private_constant :NativeSessionCloser
 
         attr_reader :backend, :batch_capacity, :compute_backend, :device, :last_batch_metrics, :model_path
 
@@ -350,10 +317,13 @@ module Cohere
 
           @mutex = Mutex.new
           @closed = false
-          @session_ownership = SessionOwnership.new(@library)
+          @session_ownership = Internal::SessionOwnership.new(
+            close: NativeSessionCloser.new(@library),
+            installed_error: "Native session ownership is already installed"
+          )
           ObjectSpace.define_finalizer(
             self,
-            self.class.send(:finalizer_for, @session_ownership)
+            Internal::SessionOwnership.finalizer_for(@session_ownership)
           )
           thread_count = normalize_threads(threads)
           # An asynchronous exception may become deliverable immediately after
@@ -410,11 +380,13 @@ module Cohere
           @mutex.synchronize do
             ensure_open!
             @last_batch_metrics = nil
-            generation_limit = max_new_tokens.nil? ? @default_max_new_tokens : Integer(max_new_tokens)
-            set_generation_limit!(generation_limit)
             binary, sample_count = float_samples(samples)
+            raise ArgumentError, "Audio segment must not be empty" if sample_count.zero?
             raise TranscriptionRuntimeError, "Audio segment is too large for the native ABI" \
               if sample_count > MAX_NATIVE_SAMPLE_COUNT
+
+            generation_limit = max_new_tokens.nil? ? @default_max_new_tokens : Integer(max_new_tokens)
+            set_generation_limit!(generation_limit)
 
             run_native_inference do
               result = @library.call(
@@ -452,15 +424,18 @@ module Cohere
           @mutex.synchronize do
             ensure_open!
             @last_batch_metrics = nil
-            generation_limit = max_new_tokens.nil? ? @default_max_new_tokens : Integer(max_new_tokens)
-            set_generation_limit!(generation_limit)
-
             buffers_and_counts = sample_batches.map { |samples| float_samples(samples) }
+            empty_lane = buffers_and_counts.index { |_binary, count| count.zero? }
+            raise ArgumentError, "Audio batch row #{empty_lane} must not be empty" if empty_lane
+
             oversized_lane = buffers_and_counts.index { |_binary, count| count > MAX_NATIVE_SAMPLE_COUNT }
             if oversized_lane
               raise TranscriptionRuntimeError,
                     "Audio batch row #{oversized_lane} is too large for the native ABI"
             end
+
+            generation_limit = max_new_tokens.nil? ? @default_max_new_tokens : Integer(max_new_tokens)
+            set_generation_limit!(generation_limit)
 
             run_native_inference do
               pointers = buffers_and_counts.map { |binary, _count| Fiddle::Pointer[binary] }
@@ -561,48 +536,16 @@ module Cohere
         # interruptible join while a private worker owns the foreign call. The
         # caller still holds @mutex, so close and another inference cannot race
         # the session; cancellation is the only concurrent C ABI operation.
-        def run_native_inference
-          outcome = Queue.new
-          worker = nil
-          Thread.handle_interrupt(Exception => :on_blocking) do
-            worker = Thread.new do
-              outcome << [:returned, yield]
-            rescue Exception => e # rubocop:disable Lint/RescueException -- transfer native cancellation intact
-              outcome << [:raised, e]
-            end
-            worker.report_on_exception = false
-
-            begin
-              worker.join
-            rescue Exception => e # rubocop:disable Lint/RescueException -- caller cancellation must win
-              cancel_and_hard_join(worker)
-              raise e
-            end
-          end
-
-          status, value = begin
-            outcome.pop(true)
-          rescue ThreadError
-            raise ExecutionError.new(
+        def run_native_inference(&)
+          Internal::InterruptibleNativeCall.run(
+            cancel: -> { @library.call(:session_cancel, @session) },
+            join_interval: CANCELLATION_JOIN_INTERVAL,
+            missing_outcome: ExecutionError.new(
               "Native Cohere inference worker exited without reporting an outcome",
               failure_kind: :fatal
-            )
-          end
-          raise value if status == :raised
-
-          value
-        end
-
-        # A cancellation can arrive after Thread.new but before the worker has
-        # entered the C function. Retry the non-poisoning session cancel until
-        # the worker exits; never kill a thread that may still own ggml state.
-        def cancel_and_hard_join(worker)
-          loop do
-            @library.call(:session_cancel, @session)
-            return if worker.join(CANCELLATION_JOIN_INTERVAL)
-          rescue Exception # rubocop:disable Lint/RescueException -- preserve the first caller exception
-            next
-          end
+            ),
+            &
+          )
         end
 
         def canonical_device(name)

@@ -5,6 +5,7 @@ module Cohere
     DEFAULT_ASR_MODEL_ID: String
     DEFAULT_ASR_MODEL_REVISION: String
     SAMPLE_RATE: Integer
+    OUTPUT_FORMATS: Array[output_format]
 
     type path_input = String | _ToPath
     type audio_input = path_input | Array[path_input]

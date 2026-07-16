@@ -17,6 +17,10 @@ module Cohere
         SystemExit => :never
       }.freeze
 
+      class PublicationDirectoryChangedError < TranscriptionRuntimeError; end
+      class PublicationEntryError < TranscriptionRuntimeError; end
+      private_constant :PublicationDirectoryChangedError, :PublicationEntryError
+
       DirectoryBinding = Data.define(
         :access_path,
         :canonical_path,
@@ -49,10 +53,10 @@ module Cohere
                   stat.dev == device && stat.ino == inode
           return self if valid
 
-          raise TranscriptionRuntimeError,
+          raise PublicationDirectoryChangedError,
                 "Publication parent changed after planning: #{access_path}"
         rescue SystemCallError, ArgumentError => e
-          raise TranscriptionRuntimeError,
+          raise PublicationDirectoryChangedError,
                 "Publication parent changed after planning: #{access_path} (#{e.message})"
         end
       end
@@ -88,7 +92,7 @@ module Cohere
             handle.close_on_exec = true
             stat = handle.stat
             unless stat.directory? && stat.dev == binding.device && stat.ino == binding.inode
-              raise TranscriptionRuntimeError,
+              raise PublicationDirectoryChangedError,
                     "Publication parent changed while it was being opened: #{binding.access_path}"
             end
             guards.each(&:verify!)
@@ -98,6 +102,7 @@ module Cohere
           rescue Interrupt, SystemExit
             raise
           rescue SystemCallError, ArgumentError => e
+            guards&.each(&:verify!)
             raise TranscriptionRuntimeError,
                   "Cannot open planned publication parent #{binding.access_path}: #{e.message}"
           ensure
@@ -169,12 +174,12 @@ module Cohere
           handle = open_entry(name, flags, 0, mode: writable ? "r+b" : "rb")
           unless handle.stat.file?
             handle.close
-            raise TranscriptionRuntimeError,
+            raise PublicationEntryError,
                   "Publication entry is not a regular file: #{display_path(name)}"
           end
           handle
         rescue Errno::ELOOP, Errno::EISDIR, Errno::ENXIO => e
-          raise TranscriptionRuntimeError,
+          raise PublicationEntryError,
                 "Publication entry is not a regular file: #{display_path(name)}",
                 cause: e
         end
@@ -198,7 +203,7 @@ module Cohere
           end
           current = handle.stat
           current.dev == expected_stat.dev && current.ino == expected_stat.ino
-        rescue Errno::ENOENT
+        rescue Errno::ENOENT, PublicationEntryError
           false
         ensure
           handle&.close
@@ -263,7 +268,7 @@ module Cohere
         def verify!
           stat = @handle.stat
           unless stat.directory? && stat.dev == binding.device && stat.ino == binding.inode
-            raise TranscriptionRuntimeError,
+            raise PublicationDirectoryChangedError,
                   "Retained publication parent changed identity: #{binding.access_path}"
           end
           @guards.each(&:verify!)

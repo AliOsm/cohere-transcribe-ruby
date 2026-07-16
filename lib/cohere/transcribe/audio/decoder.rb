@@ -63,6 +63,7 @@ module Cohere
                           ])
           extern "void* sf_open(const char*, int, void*)"
           extern "long long sf_readf_float(void*, void*, long long)"
+          extern "int sf_command(void*, int, void*, int)"
           extern "int sf_close(void*)"
           extern "const char* sf_strerror(void*)"
           AVAILABLE = true
@@ -115,8 +116,37 @@ module Cohere
         module_function
 
         SFM_READ = 0x10
+        SFC_GET_CHANNEL_MAP_INFO = 0x1100
         SRC_SINC_FASTEST = 2
         BACKENDS = %w[auto ffmpeg torchcodec librosa libsndfile].freeze
+        SQRT_HALF = Math.sqrt(0.5)
+        DEFAULT_MONO_MIXES = {
+          1 => [1.0],
+          2 => [SQRT_HALF, SQRT_HALF],
+          3 => [SQRT_HALF, SQRT_HALF, 0.0],
+          4 => [SQRT_HALF, SQRT_HALF, 1.0, 0.5],
+          5 => [SQRT_HALF, SQRT_HALF, 1.0, 0.5, 0.5],
+          6 => [SQRT_HALF, SQRT_HALF, 1.0, 0.0, 0.5, 0.5],
+          7 => [SQRT_HALF, SQRT_HALF, 1.0, 0.0, 0.5, 0.5, 0.5],
+          8 => [SQRT_HALF, SQRT_HALF, 1.0, 0.0, 0.5, 0.5, 0.5, 0.5]
+        }.transform_values(&:freeze).freeze
+        CHANNEL_POSITION_MONO_MIXES = {
+          1 => 1.0,       # mono
+          2 => SQRT_HALF, # left
+          3 => SQRT_HALF, # right
+          4 => 1.0,       # center
+          5 => SQRT_HALF, # front left
+          6 => SQRT_HALF, # front right
+          7 => 1.0,       # front center
+          8 => 0.5,       # rear center
+          9 => 0.5,       # rear left
+          10 => 0.5,      # rear right
+          11 => 0.0,      # low-frequency effects
+          12 => SQRT_HALF, # front left of center
+          13 => SQRT_HALF, # front right of center
+          14 => 0.5,      # side left
+          15 => 0.5       # side right
+        }.freeze
 
         # Best-effort metadata probe used for public skipped-result parity. It
         # may inspect container headers and demuxer probe packets but never
@@ -131,8 +161,7 @@ module Cohere
           end
           return nil unless SoundFileABI::AVAILABLE
 
-          SoundFileABI::SFInfo.malloc(Fiddle::RUBY_FREE) do |info|
-            handle = SoundFileABI.sf_open(source.to_s, SFM_READ, info.to_ptr)
+          with_sound_file(source) do |handle, info|
             return nil if handle.null?
 
             frames = Integer(info.frames)
@@ -146,8 +175,6 @@ module Cohere
           end
         rescue Fiddle::DLError, SystemCallError, TranscriptionRuntimeError
           nil
-        ensure
-          SoundFileABI.sf_close(handle) if defined?(handle) && handle && !handle.null?
         end
 
         # Best-effort upper bound for the buffers governed by max_decoded_bytes.
@@ -161,10 +188,7 @@ module Cohere
           source = Pathname(path).expand_path
           return unless source.file?
 
-          native_ffmpeg_available = %w[auto librosa].include?(requested) && FFmpegNative.available?
-          use_ffmpeg = requested == "ffmpeg" || requested == "torchcodec" ||
-                       (%w[auto librosa].include?(requested) && native_ffmpeg_available)
-          if use_ffmpeg
+          if ffmpeg_backend?(requested)
             duration = FFmpegNative.duration(source)
             return unless duration&.finite? && duration >= 0.0
 
@@ -172,8 +196,7 @@ module Cohere
           end
           return unless SoundFileABI::AVAILABLE
 
-          SoundFileABI::SFInfo.malloc(Fiddle::RUBY_FREE) do |info|
-            handle = SoundFileABI.sf_open(source.to_s, SFM_READ, info.to_ptr)
+          with_sound_file(source) do |handle, info|
             next if handle.null?
 
             frames = Integer(info.frames)
@@ -181,14 +204,10 @@ module Cohere
             source_rate = Integer(info.samplerate)
             next unless frames >= 0 && channels.positive? && source_rate.positive?
 
-            input_bytes = frames * channels * Fiddle::SIZEOF_FLOAT
-            output_frames = (frames * sample_rate.fdiv(source_rate)).ceil + 64
-            [input_bytes, output_frames * Fiddle::SIZEOF_FLOAT].max
+            projected_decoded_bytes(frames, channels, source_rate, sample_rate)
           end
         rescue Fiddle::DLError, SystemCallError, TranscriptionRuntimeError
           nil
-        ensure
-          SoundFileABI.sf_close(handle) if defined?(handle) && handle && !handle.null?
         end
 
         def decode(path, backend: "auto", sample_rate: SAMPLE_RATE, max_decoded_bytes: 4 * (1024**3))
@@ -205,10 +224,7 @@ module Cohere
           raise TranscriptionInputError, "Input does not exist: #{source}" unless source.exist?
           raise TranscriptionInputError, "Input is not a regular file: #{source}" unless source.file?
 
-          native_ffmpeg_available = %w[auto librosa].include?(requested) && FFmpegNative.available?
-          use_ffmpeg = requested == "ffmpeg" || requested == "torchcodec" ||
-                       (%w[auto librosa].include?(requested) && native_ffmpeg_available)
-          if use_ffmpeg
+          if ffmpeg_backend?(requested)
             samples = FFmpegNative.decode(
               source,
               sample_rate: sample_rate,
@@ -239,67 +255,54 @@ module Cohere
             raise TranscriptionRuntimeError, "libsndfile is required for native audio decoding: #{sound_file_error}"
           end
 
-          SoundFileABI::SFInfo.malloc(Fiddle::RUBY_FREE) do |info|
-            handle = SoundFileABI.sf_open(source.to_s, SFM_READ, info.to_ptr)
+          with_sound_file(source) do |handle, info|
             raise TranscriptionRuntimeError, "Cannot decode #{source}: #{SoundFileABI.sf_strerror(handle)}" if handle.null?
 
-            begin
-              frames = Integer(info.frames)
-              channels = Integer(info.channels)
-              source_rate = Integer(info.samplerate)
-              unless frames >= 0 && channels.positive? && source_rate.positive?
-                raise TranscriptionRuntimeError, "Decoder returned invalid audio metadata for #{source}"
-              end
-
-              input_bytes = frames * channels * Fiddle::SIZEOF_FLOAT
-              output_frames = (frames * sample_rate.fdiv(source_rate)).ceil + 64
-              projected_bytes = [input_bytes, output_frames * Fiddle::SIZEOF_FLOAT].max
-              if max_decoded_bytes && projected_bytes > max_decoded_bytes
-                raise TranscriptionRuntimeError,
-                      "Decoded audio exceeds the configured memory limit for #{source} " \
-                      "(#{projected_bytes} > #{max_decoded_bytes} bytes)"
-              end
-
-              raw = Fiddle::Pointer.malloc([input_bytes, 1].max, Fiddle::RUBY_FREE)
-              read_frames = SoundFileABI.sf_readf_float(handle, raw, frames)
-              raise TranscriptionRuntimeError, "Cannot decode #{source}: #{SoundFileABI.sf_strerror(handle)}" if read_frames.negative?
-              raise TranscriptionRuntimeError, "Decoder returned more frames than allocated for #{source}" if read_frames > frames
-
-              frames = read_frames
-              begin
-                require "numo/narray"
-              rescue LoadError => e
-                raise TranscriptionRuntimeError, "numo-narray is required for decoded audio: #{e.message}"
-              end
-              interleaved = if frames.zero?
-                              nil
-                            else
-                              Numo::SFloat.from_binary(raw[0, frames * channels * Fiddle::SIZEOF_FLOAT])
-                            end
-              mono = if frames.zero?
-                       Numo::SFloat.zeros(0)
-                     elsif channels == 1
-                       interleaved
-                     elsif channels == 2
-                       (interleaved.reshape(frames, channels).sum(1) * Math.sqrt(0.5)).cast_to(Numo::SFloat)
-                     else
-                       interleaved.reshape(frames, channels).mean(1).cast_to(Numo::SFloat)
-                     end
-              samples = source_rate == sample_rate ? mono : resample(mono, source_rate, sample_rate, max_decoded_bytes)
-              validate_finite!(samples)
-              Decoded.new(
-                samples: samples.freeze,
-                sample_rate: sample_rate,
-                backend: "libsndfile",
-                fallback_reason: if %w[auto libsndfile].include?(requested)
-                                   nil
-                                 else
-                                   "Ruby #{requested} compatibility mode uses the native libsndfile ABI"
-                                 end
-              )
-            ensure
-              SoundFileABI.sf_close(handle)
+            frames = Integer(info.frames)
+            channels = Integer(info.channels)
+            source_rate = Integer(info.samplerate)
+            unless frames >= 0 && channels.positive? && source_rate.positive?
+              raise TranscriptionRuntimeError, "Decoder returned invalid audio metadata for #{source}"
             end
+
+            input_bytes = frames * channels * Fiddle::SIZEOF_FLOAT
+            projected_bytes = projected_decoded_bytes(frames, channels, source_rate, sample_rate)
+            if max_decoded_bytes && projected_bytes > max_decoded_bytes
+              raise DecodedAudioLimitError,
+                    "Decoded audio exceeds the configured memory limit for #{source} " \
+                    "(#{projected_bytes} > #{max_decoded_bytes} bytes)"
+            end
+
+            raw = Fiddle::Pointer.malloc([input_bytes, 1].max, Fiddle::RUBY_FREE)
+            channel_map = sound_file_channel_map(handle, channels)
+            read_frames = SoundFileABI.sf_readf_float(handle, raw, frames)
+            raise TranscriptionRuntimeError, "Cannot decode #{source}: #{SoundFileABI.sf_strerror(handle)}" if read_frames.negative?
+            raise TranscriptionRuntimeError, "Decoder returned more frames than allocated for #{source}" if read_frames > frames
+
+            frames = read_frames
+            begin
+              require "numo/narray"
+            rescue LoadError => e
+              raise TranscriptionRuntimeError, "numo-narray is required for decoded audio: #{e.message}"
+            end
+            interleaved = if frames.zero?
+                            nil
+                          else
+                            Numo::SFloat.from_binary(raw[0, frames * channels * Fiddle::SIZEOF_FLOAT])
+                          end
+            mono = downmix(interleaved, frames, channels, channel_map)
+            samples = source_rate == sample_rate ? mono : resample(mono, source_rate, sample_rate, max_decoded_bytes)
+            validate_finite!(samples)
+            Decoded.new(
+              samples: samples.freeze,
+              sample_rate: sample_rate,
+              backend: "libsndfile",
+              fallback_reason: if %w[auto libsndfile].include?(requested)
+                                 nil
+                               else
+                                 "Ruby #{requested} compatibility mode uses the native libsndfile ABI"
+                               end
+            )
           end
         end
 
@@ -318,7 +321,7 @@ module Cohere
           output_capacity = (samples.length * ratio).ceil + 64
           bytes = output_capacity * Fiddle::SIZEOF_FLOAT
           if max_decoded_bytes && bytes > max_decoded_bytes
-            raise TranscriptionRuntimeError, "Resampled audio exceeds the configured memory limit"
+            raise DecodedAudioLimitError, "Resampled audio exceeds the configured memory limit"
           end
 
           input_string = samples.to_binary
@@ -357,6 +360,62 @@ module Cohere
           samples
         end
         private_class_method :validate_finite!
+
+        def ffmpeg_backend?(requested)
+          return true if %w[ffmpeg torchcodec].include?(requested)
+
+          %w[auto librosa].include?(requested) && FFmpegNative.available?
+        end
+        private_class_method :ffmpeg_backend?
+
+        def projected_decoded_bytes(frames, channels, source_rate, target_rate)
+          input_bytes = frames * channels * Fiddle::SIZEOF_FLOAT
+          output_frames = (frames * target_rate.fdiv(source_rate)).ceil + 64
+          [input_bytes, output_frames * Fiddle::SIZEOF_FLOAT].max
+        end
+        private_class_method :projected_decoded_bytes
+
+        def with_sound_file(source)
+          SoundFileABI::SFInfo.malloc(Fiddle::RUBY_FREE) do |info|
+            handle = SoundFileABI.sf_open(source.to_s, SFM_READ, info.to_ptr)
+            begin
+              yield handle, info
+            ensure
+              SoundFileABI.sf_close(handle) unless handle.null?
+            end
+          end
+        end
+        private_class_method :with_sound_file
+
+        # libswresample's default mono matrix for av_channel_layout_default
+        # layouts. Formats with more than eight unspecified channels retain a
+        # conservative arithmetic mean because FFmpeg has no common default
+        # layout for them.
+        def downmix(interleaved, frames, channels, channel_map)
+          return Numo::SFloat.zeros(0) if frames.zero?
+          return interleaved if channels == 1
+
+          matrix = interleaved.reshape(frames, channels)
+          weights = channel_map&.map { |position| CHANNEL_POSITION_MONO_MIXES[position] }
+          weights = nil if weights&.any?(&:nil?)
+          weights ||= DEFAULT_MONO_MIXES[channels]
+          return matrix.mean(1).cast_to(Numo::SFloat) unless weights
+
+          matrix.dot(Numo::SFloat[*weights]).cast_to(Numo::SFloat)
+        end
+        private_class_method :downmix
+
+        def sound_file_channel_map(handle, channels)
+          buffer = Array.new(channels, 0).pack("i!*")
+          available = SoundFileABI.sf_command(
+            handle,
+            SFC_GET_CHANNEL_MAP_INFO,
+            Fiddle::Pointer[buffer],
+            buffer.bytesize
+          )
+          available == 1 ? buffer.unpack("i!*") : nil
+        end
+        private_class_method :sound_file_channel_map
       end
     end
   end

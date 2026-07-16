@@ -51,6 +51,8 @@ module Cohere
         def test_validate_rejects_malformed_nonfinite_outside_overlap_and_long_rows
           assert_raises(ArgumentError) { Segmentation.validate([[0, 1, 2]], 2.0) }
           assert_raises(ArgumentError) { Segmentation.validate([[0, Float::NAN]], 2.0) }
+          error = assert_raises(ArgumentError) { Segmentation.validate([[1.0, 0.5]], 2.0) }
+          assert_equal "Segment 0 has inverted bounds", error.message
           assert_raises(ArgumentError) { Segmentation.validate([[-1, 1]], 2.0) }
           assert_raises(ArgumentError) { Segmentation.validate([[0, 1], [0.5, 2]], 2.0) }
           assert_raises(ArgumentError) { Segmentation.validate([[0, 1.1]], 2.0, max_duration: 1.0) }

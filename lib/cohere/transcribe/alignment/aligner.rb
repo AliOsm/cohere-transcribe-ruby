@@ -231,6 +231,7 @@ module Cohere
         WINDOW_SAMPLES = WINDOW_SECONDS * SAMPLE_RATE
         CONTEXT_SAMPLES = CONTEXT_SECONDS * SAMPLE_RATE
         INPUT_SAMPLES = WINDOW_SAMPLES + (2 * CONTEXT_SAMPLES)
+        MINIMUM_INPUT_SAMPLES = 400
         WINDOW_FRAMES = WINDOW_SAMPLES / INPUTS_TO_LOGITS_RATIO
         CONTEXT_FRAMES = CONTEXT_SAMPLES / INPUTS_TO_LOGITS_RATIO
         STRIDE_MS = INPUTS_TO_LOGITS_RATIO * 1_000.0 / SAMPLE_RATE
@@ -289,6 +290,7 @@ module Cohere
           started = monotonic
           samples = mono_float32(audio)
           raise ArgumentError, "Cannot compute CTC emissions for empty audio" if samples.empty?
+          return [compute_direct_emissions(samples), STRIDE_MS] if samples.length < WINDOW_SAMPLES
 
           total_windows = (samples.length + WINDOW_SAMPLES - 1) / WINDOW_SAMPLES
           extension_samples = (total_windows * WINDOW_SAMPLES) - samples.length
@@ -320,10 +322,7 @@ module Cohere
             end
 
             class_count = batch_log_probs.shape[1]
-            unless class_count == VOCABULARY.length
-              raise TranscriptionRuntimeError,
-                    "MMS aligner returned #{class_count} classes; expected #{VOCABULARY.length}"
-            end
+            validate_class_count!(class_count)
             emissions ||= Numo::SFloat.zeros(frame_count, class_count + 1)
             if first_window + window_count == total_windows && extension_frames.positive?
               kept = batch_log_probs.shape[0] - extension_frames
@@ -440,6 +439,29 @@ module Cohere
           batch
         end
 
+        # The pinned ctc-forced-aligner passes sub-30-second waveforms to MMS
+        # directly, without window context or tail padding. Its Wav2Vec2 feature
+        # extractor needs at least its 400-sample convolutional receptive field,
+        # so only shorter inputs receive the minimum right padding needed to run.
+        def compute_direct_emissions(audio)
+          input_samples = [audio.length, MINIMUM_INPUT_SAMPLES].max
+          input = Numo::SFloat.zeros(1, input_samples)
+          input[0, 0...audio.length] = audio
+          logits = session.run(input)
+          logits = Numo::SFloat.cast(logits) unless logits.is_a?(Numo::NArray)
+          unless logits.ndim == 3 && logits.shape[0] == 1 && logits.shape[1].positive?
+            raise TranscriptionRuntimeError,
+                  "MMS aligner returned invalid direct logits shape #{logits.shape.inspect}"
+          end
+
+          class_count = logits.shape[2]
+          validate_class_count!(class_count)
+          log_probs = log_softmax(logits.reshape(logits.shape[1], class_count))
+          emissions = Numo::SFloat.zeros(log_probs.shape[0], class_count + 1)
+          emissions[true, 0...class_count] = log_probs
+          emissions
+        end
+
         def crop_and_normalize(logits, expected_batch)
           logits = Numo::SFloat.cast(logits) unless logits.is_a?(Numo::NArray)
           unless logits.ndim == 3 && logits.shape[0] == expected_batch &&
@@ -451,10 +473,21 @@ module Cohere
           classes = logits.shape[2]
           cropped = logits[true, CONTEXT_FRAMES...(CONTEXT_FRAMES + WINDOW_FRAMES), true]
                     .reshape(expected_batch * WINDOW_FRAMES, classes)
-          maxima = cropped.max(1).reshape(cropped.shape[0], 1)
-          shifted = cropped - maxima
-          denominators = Numo::NMath.log(Numo::NMath.exp(shifted).sum(1)).reshape(cropped.shape[0], 1)
+          log_softmax(cropped)
+        end
+
+        def log_softmax(logits)
+          maxima = logits.max(1).reshape(logits.shape[0], 1)
+          shifted = logits - maxima
+          denominators = Numo::NMath.log(Numo::NMath.exp(shifted).sum(1)).reshape(logits.shape[0], 1)
           (shifted - denominators).cast_to(Numo::SFloat)
+        end
+
+        def validate_class_count!(class_count)
+          return if class_count == VOCABULARY.length
+
+          raise TranscriptionRuntimeError,
+                "MMS aligner returned #{class_count} classes; expected #{VOCABULARY.length}"
         end
 
         def uniform_fallback(text, start_time, end_time, segment_index)

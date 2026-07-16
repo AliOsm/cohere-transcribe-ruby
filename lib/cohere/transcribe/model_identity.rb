@@ -42,7 +42,7 @@ module Cohere
           raise ArgumentError,
                 "Cannot resolve #{description.downcase} path #{reference.inspect}: #{e.message}"
         end
-        return path.realpath.to_s if path.directory?
+        return utf8_resolved_path(path.realpath.to_s, description) if path.directory?
         if path.exist? || path.symlink?
           raise ArgumentError,
                 "#{description} path #{reference.inspect} is not a directory"
@@ -58,6 +58,14 @@ module Cohere
       rescue SystemCallError => e
         raise ArgumentError, "Cannot resolve #{description.downcase} path #{reference.inspect}: #{e.message}"
       end
+
+      def utf8_resolved_path(value, description)
+        text = value.b.dup.force_encoding(Encoding::UTF_8)
+        return text if text.valid_encoding?
+
+        raise ArgumentError, "#{description} resolved path must contain valid UTF-8"
+      end
+      private_class_method :utf8_resolved_path
 
       # Path.expanduser() expands only the leading home-directory component;
       # unlike Pathname#expand_path, it does not lexically erase a missing

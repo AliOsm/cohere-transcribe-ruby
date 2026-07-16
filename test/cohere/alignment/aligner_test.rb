@@ -34,6 +34,22 @@ class Cohere::Transcribe::Alignment::AlignerTest < Minitest::Test
     end
   end
 
+  class LengthAwareSession
+    attr_reader :calls
+
+    def initialize
+      @calls = []
+    end
+
+    def run(input_values)
+      calls << input_values.dup
+      frames = ((input_values.shape[1] - Aligner::MINIMUM_INPUT_SAMPLES) / Aligner::INPUTS_TO_LOGITS_RATIO) + 1
+      raise "input is shorter than the MMS feature extractor" unless frames.positive?
+
+      Numo::SFloat.zeros(input_values.shape[0], frames, 31)
+    end
+  end
+
   def test_ctc_kernel_matches_torchaudio_tie_breaking_and_repeated_targets
     log_probs = Numo::SFloat.cast(
       [
@@ -140,6 +156,42 @@ class Cohere::Transcribe::Alignment::AlignerTest < Minitest::Test
     assert_equal 0.0, input[1, length - 448_000]
     assert_in_delta(-Math.log(31), emissions[0, 0], 1e-6)
     assert_equal 0.0, emissions[0, 31]
+  end
+
+  def test_short_audio_uses_the_pinned_direct_frame_geometry
+    sample_count = 32_000
+    audio = Numo::SFloat.new(sample_count).seq
+    session = LengthAwareSession.new
+    emissions, stride = Aligner.new(session: session).compute_emissions(audio)
+
+    direct_frames = ((sample_count - Aligner::MINIMUM_INPUT_SAMPLES) / Aligner::INPUTS_TO_LOGITS_RATIO) + 1
+    formerly_padded_frames = Aligner::WINDOW_FRAMES -
+                             ((Aligner::WINDOW_SAMPLES - sample_count) / Aligner::INPUTS_TO_LOGITS_RATIO)
+    assert_equal [1, sample_count], session.calls.fetch(0).shape
+    assert_equal [99, 32], emissions.shape
+    assert_equal direct_frames, emissions.shape[0]
+    assert_equal 1, formerly_padded_frames - direct_frames
+    assert_equal 20.0, (formerly_padded_frames - direct_frames) * stride
+    assert_equal audio[0], session.calls.fetch(0)[0, 0]
+    assert_equal audio[-1], session.calls.fetch(0)[0, -1]
+    assert_in_delta(-Math.log(31), emissions[0, 0], 1e-6)
+    assert_equal 0.0, emissions[0, 31]
+  end
+
+  def test_audio_below_the_feature_receptive_field_gets_only_minimum_right_padding
+    [1, Aligner::MINIMUM_INPUT_SAMPLES - 1].each do |sample_count|
+      audio = Numo::SFloat.new(sample_count).seq + 1
+      session = LengthAwareSession.new
+      emissions, stride = Aligner.new(session: session).compute_emissions(audio)
+      input = session.calls.fetch(0)
+
+      assert_equal [1, Aligner::MINIMUM_INPUT_SAMPLES], input.shape
+      assert_equal audio[0], input[0, 0]
+      assert_equal audio[-1], input[0, sample_count - 1]
+      assert_equal 0.0, input[0, sample_count]
+      assert_equal [1, 32], emissions.shape
+      assert_equal 20.0, stride
+    end
   end
 
   def test_emission_batch_halves_on_memory_error_without_losing_windows

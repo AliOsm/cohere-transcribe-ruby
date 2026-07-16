@@ -1,0 +1,123 @@
+# frozen_string_literal: true
+
+require "test_helper"
+require "cohere/transcribe/internal/interruptible_native_call"
+
+class Cohere::Transcribe::InterruptibleNativeCallTest < Minitest::Test
+  Runner = Cohere::Transcribe::Internal::InterruptibleNativeCall
+
+  def test_returns_the_worker_value_and_assigns_its_name
+    value = Runner.run(
+      cancel: -> { flunk "completed calls must not cancel" },
+      join_interval: 0.001,
+      missing_outcome: RuntimeError.new("missing"),
+      thread_name: "native-call-test"
+    ) { [Thread.current.name, 42] }
+
+    assert_equal ["native-call-test", 42], value
+  end
+
+  def test_worker_exception_is_raised_on_the_caller
+    failure = RuntimeError.new("worker failed")
+
+    error = assert_raises(RuntimeError) do
+      Runner.run(
+        cancel: -> { flunk "worker failures must not cancel" },
+        join_interval: 0.001,
+        missing_outcome: RuntimeError.new("missing")
+      ) { raise failure }
+    end
+
+    assert_same failure, error
+  end
+
+  def test_caller_exception_wins_while_cancel_retries_until_the_worker_exits
+    started = Queue.new
+    release = Queue.new
+    cancel_calls = 0
+    caller = Thread.current
+    interrupter = Thread.new do
+      started.pop
+      caller.raise(Interrupt, "caller stopped")
+    end
+    cancel = lambda do
+      cancel_calls += 1
+      raise "first cancel failed" if cancel_calls == 1
+
+      release << true if cancel_calls == 3
+    end
+
+    error = assert_raises(Interrupt) do
+      Runner.run(
+        cancel: cancel,
+        join_interval: 0.001,
+        missing_outcome: RuntimeError.new("missing")
+      ) do
+        started << true
+        release.pop
+        raise "worker failed during cancellation"
+      end
+    end
+
+    assert_equal "caller stopped", error.message
+    assert_operator cancel_calls, :>=, 3
+  ensure
+    interrupter&.join
+    release << true if defined?(release) && release.empty?
+  end
+
+  def test_missing_worker_outcome_raises_the_supplied_exception
+    started = Queue.new
+    missing = RuntimeError.new("worker vanished")
+    killer = Thread.new { started.pop.kill }
+
+    error = assert_raises(RuntimeError) do
+      Runner.run(
+        cancel: -> { flunk "an externally killed worker has already exited" },
+        join_interval: 0.001,
+        missing_outcome: missing
+      ) do
+        started << Thread.current
+        sleep
+      end
+    end
+
+    assert_same missing, error
+  ensure
+    killer&.join
+  end
+
+  def test_caller_exception_survives_an_always_failing_cancel_after_the_worker_finishes
+    started = Queue.new
+    cancel_calls = 0
+    failure = nil
+    caller = Thread.new do
+      Runner.run(
+        cancel: lambda {
+          cancel_calls += 1
+          raise "cancel failed"
+        },
+        join_interval: 0.001,
+        missing_outcome: RuntimeError.new("missing")
+      ) do
+        started << true
+        sleep 0.02
+      end
+    rescue Exception => e # rubocop:disable Lint/RescueException -- capture caller interruption for assertion
+      failure = e
+    end
+    interrupter = Thread.new do
+      started.pop
+      caller.raise(Interrupt, "caller stopped")
+    end
+
+    assert caller.join(2), "caller remained stuck after its worker exited"
+    assert_instance_of Interrupt, failure
+    assert_equal "caller stopped", failure.message
+    assert_operator cancel_calls, :>, 0
+  ensure
+    caller&.kill
+    caller&.join
+    interrupter&.join
+  end
+end

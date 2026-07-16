@@ -2,6 +2,7 @@
 
 require "test_helper"
 require "tmpdir"
+require "cohere/transcribe/audio/decoder"
 
 module Cohere
   module Transcribe
@@ -36,6 +37,9 @@ module Cohere
         end
 
         def test_decode_size_estimate_covers_the_libsndfile_stereo_input_buffer
+          sound_file = Audio.const_get(:SoundFileABI, false)
+          skip "libsndfile is unavailable" unless sound_file.const_get(:AVAILABLE)
+
           with_wav(sample_rate: SAMPLE_RATE, channels: 2, frames: 400) do |path|
             replace_singleton_methods(FFmpegNative, available?: -> { false }) do
               estimate = Decoder.estimate_decoded_bytes(
@@ -47,6 +51,31 @@ module Cohere
               assert_equal 400 * 2 * Fiddle::SIZEOF_FLOAT, estimate
             end
           end
+        end
+
+        def test_libsndfile_metadata_probes_close_every_open_handle
+          sound_file = Audio.const_get(:SoundFileABI, false)
+          skip "libsndfile is unavailable" unless sound_file.const_get(:AVAILABLE)
+
+          closed_handles = []
+          original_close = sound_file.method(:sf_close)
+          close = lambda do |handle|
+            closed_handles << handle.to_i
+            original_close.call(handle)
+          end
+
+          with_wav(sample_rate: 8_000, channels: 2, frames: 400) do |path|
+            replace_singleton_methods(sound_file, sf_close: close) do
+              replace_singleton_methods(FFmpegNative, available?: -> { false }) do
+                assert_in_delta 0.05, Decoder.probe_duration(path), 1e-9
+                assert_equal ((400 * 2) + 64) * Fiddle::SIZEOF_FLOAT,
+                             Decoder.estimate_decoded_bytes(path, backend: "librosa")
+              end
+            end
+          end
+
+          assert_equal 2, closed_handles.length
+          assert closed_handles.all?(&:positive?)
         end
 
         def test_libsndfile_metadata_allocations_register_release_callbacks
@@ -136,6 +165,62 @@ module Cohere
           end
         end
 
+        def test_libsndfile_common_5_1_downmix_matches_native_ffmpeg_matrix
+          sound_file = Audio.const_get(:SoundFileABI, false)
+          skip "libsndfile is unavailable" unless sound_file.const_get(:AVAILABLE)
+
+          with_wav(
+            sample_rate: SAMPLE_RATE,
+            channels: 6,
+            frames: 400,
+            channel_values: [8_192, 8_192, 8_192, 8_192, 8_192, 8_192]
+          ) do |path|
+            replace_singleton_methods(FFmpegNative, available?: -> { false }) do
+              decoded = Decoder.decode(path, backend: "librosa")
+              expected = 0.25 * ((2 * Math.sqrt(0.5)) + 1.0 + (2 * 0.5))
+
+              assert_equal "libsndfile", decoded.backend
+              assert_in_delta expected, decoded.samples[200], 1e-6
+            end
+          end
+        end
+
+        def test_libsndfile_and_native_ffmpeg_match_common_5_1_layout
+          sound_file = Audio.const_get(:SoundFileABI, false)
+          skip "libsndfile or native FFmpeg is unavailable" unless sound_file.const_get(:AVAILABLE) && FFmpegNative.available?
+
+          with_wav(
+            sample_rate: SAMPLE_RATE,
+            channels: 6,
+            frames: 400,
+            channel_values: [8_192, 8_192, 8_192, 8_192, 8_192, 8_192]
+          ) do |path|
+            fallback = Decoder.decode(path, backend: "libsndfile")
+            native = Decoder.decode(path, backend: "ffmpeg")
+
+            assert_in_delta native.samples[200], fallback.samples[200], 1e-6
+          end
+        end
+
+        def test_libsndfile_uses_an_explicit_three_channel_layout
+          sound_file = Audio.const_get(:SoundFileABI, false)
+          skip "libsndfile is unavailable" unless sound_file.const_get(:AVAILABLE)
+
+          with_wav_extensible(
+            sample_rate: SAMPLE_RATE,
+            channel_values: [0, 0, 8_192],
+            channel_mask: 0x7
+          ) do |path|
+            decoded = Decoder.decode(path, backend: "libsndfile")
+
+            assert_in_delta 0.25, decoded.samples[200], 1e-6
+            if FFmpegNative.available?
+              native = Decoder.decode(path, backend: "ffmpeg")
+              assert_in_delta native.samples[200], decoded.samples[200], 1e-6
+            end
+          end
+        end
+
         def test_explicit_ffmpeg_uses_native_abi_or_fails_cleanly_when_adapter_is_absent
           with_wav(sample_rate: SAMPLE_RATE, channels: 1, frames: 10) do |path|
             if FFmpegNative.available?
@@ -189,11 +274,22 @@ module Cohere
 
         def test_memory_limit_is_checked_before_allocation
           with_wav(sample_rate: SAMPLE_RATE, channels: 2, frames: 100) do |path|
-            error = assert_raises(TranscriptionRuntimeError) do
+            error = assert_raises(DecodedAudioLimitError) do
               Decoder.decode(path, max_decoded_bytes: 16)
             end
             assert_match(/memory limit/, error.message)
           end
+        end
+
+        def test_resample_memory_limit_uses_the_typed_limit_error
+          sample_rate = Audio.const_get(:SampleRateABI, false)
+          skip "libsamplerate is unavailable" unless sample_rate.const_get(:AVAILABLE)
+          require "numo/narray"
+
+          error = assert_raises(DecodedAudioLimitError) do
+            Decoder.resample(Numo::SFloat.zeros(100), 8_000, SAMPLE_RATE, 16)
+          end
+          assert_match(/memory limit/, error.message)
         end
 
         def test_missing_and_nonregular_inputs_are_typed
@@ -249,12 +345,13 @@ module Cohere
           end
         end
 
-        def with_wav(sample_rate:, channels:, frames:)
+        def with_wav(sample_rate:, channels:, frames:, channel_values: nil)
           Dir.mktmpdir do |directory|
             path = File.join(directory, "fixture.wav")
-            values = Array.new(frames) do
-              channels == 1 ? [4_096] : [16_384, -8_192]
-            end.flatten
+            frame_values = channel_values || (channels == 1 ? [4_096] : [16_384, -8_192])
+            raise ArgumentError, "channel_values must contain one sample per channel" unless frame_values.length == channels
+
+            values = Array.new(frames, frame_values).flatten
             pcm = values.pack("s<*")
             header = [
               "RIFF", 36 + pcm.bytesize, "WAVE", "fmt ", 16, 1, channels,
@@ -262,6 +359,27 @@ module Cohere
               "data", pcm.bytesize
             ].pack("a4Va4a4VvvVVvva4V")
             File.binwrite(path, header + pcm)
+            yield path
+          end
+        rescue TranscriptionRuntimeError => e
+          skip e.message if e.message.match?(/libsndfile|libsamplerate/)
+
+          raise
+        end
+
+        def with_wav_extensible(sample_rate:, channel_values:, channel_mask:, frames: 400)
+          Dir.mktmpdir do |directory|
+            path = File.join(directory, "fixture.wav")
+            channels = channel_values.length
+            pcm = Array.new(frames, channel_values).flatten.pack("s<*")
+            format = [
+              0xfffe, channels, sample_rate, sample_rate * channels * 2,
+              channels * 2, 16, 22, 16, channel_mask
+            ].pack("vvVVvvvvV")
+            format << ["0100000000001000800000aa00389b71"].pack("H*")
+            header = ["RIFF", 60 + pcm.bytesize, "WAVE", "fmt ", 40].pack("a4Va4a4V")
+            data = ["data", pcm.bytesize].pack("a4V")
+            File.binwrite(path, header + format + data + pcm)
             yield path
           end
         rescue TranscriptionRuntimeError => e

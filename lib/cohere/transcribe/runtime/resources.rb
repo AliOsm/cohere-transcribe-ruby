@@ -3,6 +3,8 @@
 require "monitor"
 require "weakref"
 
+require_relative "../internal/session_ownership"
+
 module Cohere
   module Transcribe
     module Runtime
@@ -11,47 +13,6 @@ module Cohere
       # when applications create multiple reusable Transcribers.
       class ModelResources
         OWNER_GUARD = Monitor.new
-
-        # The global owner record and the ObjectSpace finalizer retain this
-        # state, never the ModelResources instance itself. It also lets a new
-        # owner synchronously evict a collected predecessor before loading.
-        class SessionOwnership
-          def initialize
-            @mutex = Mutex.new
-            @session = nil
-          end
-
-          def session
-            @mutex.synchronize { @session }
-          end
-
-          def install(session)
-            @mutex.synchronize do
-              raise TranscriptionRuntimeError, "ASR session ownership is already installed" if @session
-
-              @session = session
-            end
-          end
-
-          def close
-            session = @mutex.synchronize do
-              current = @session
-              @session = nil
-              current
-            end
-            return unless session
-
-            session.close
-            nil
-          end
-
-          def finalize
-            close
-          rescue Exception # rubocop:disable Lint/RescueException -- finalizers must not escape during GC or shutdown
-            nil
-          end
-        end
-        private_constant :SessionOwnership
 
         class << self
           def evict_current_asr_owner
@@ -118,7 +79,9 @@ module Cohere
 
         def initialize
           @asr_key = nil
-          @asr_ownership = SessionOwnership.new
+          @asr_ownership = Internal::SessionOwnership.new(
+            installed_error: "ASR session ownership is already installed"
+          )
           @batch_controller = nil
           @closed = false
           ObjectSpace.define_finalizer(

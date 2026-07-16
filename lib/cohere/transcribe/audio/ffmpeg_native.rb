@@ -4,16 +4,21 @@ require "fiddle"
 require "rbconfig"
 
 require_relative "../errors"
+require_relative "../internal/interruptible_native_call"
 
 module Cohere
   module Transcribe
     module Audio
+      class DecodedAudioLimitError < TranscriptionRuntimeError; end
+
       # Lazy binding for the gem's subprocess-free libav decoder adapter. The
       # adapter itself dynamically selects a compatible FFmpeg 4-8 runtime;
       # Ruby never launches ffmpeg and does not retain a Python codec runtime.
       module FFmpegNative
         ERROR_CAPACITY = 1_024
         CANCELLED_STATUS = 6
+        DECODED_AUDIO_LIMIT_STATUS = 4
+        CANCELLATION_JOIN_INTERVAL = 0.01
 
         class Library
           FUNCTIONS = {
@@ -111,24 +116,15 @@ module Cohere
           end
 
           def decode(path, sample_rate:, max_decoded_bytes:)
-            worker = Thread.new do
+            Internal::InterruptibleNativeCall.run(
+              cancel: -> { @functions.fetch(:cancel).call },
+              join_interval: CANCELLATION_JOIN_INTERVAL,
+              missing_outcome: TranscriptionRuntimeError.new(
+                "Native FFmpeg decode worker exited without reporting an outcome"
+              ),
+              thread_name: "cohere-ffmpeg-decode"
+            ) do
               decode_owned(path, sample_rate: sample_rate, max_decoded_bytes: max_decoded_bytes)
-            end
-            worker.name = "cohere-ffmpeg-decode" if worker.respond_to?(:name=)
-            worker.report_on_exception = false
-            completed = false
-            result = worker.value
-            completed = true
-            result
-          ensure
-            if defined?(worker) && worker && !completed
-              Thread.handle_interrupt(Exception => :never) do
-                @functions.fetch(:cancel).call if worker.alive?
-              rescue StandardError
-                nil
-              ensure
-                worker.join
-              end
             end
           end
 
@@ -159,6 +155,9 @@ module Cohere
                   detail = message.to_s.force_encoding(Encoding::UTF_8).scrub
                   unless status.zero?
                     raise Interrupt, "Native FFmpeg decode was cancelled for #{path}: #{detail}" if status == CANCELLED_STATUS
+                    if status == DECODED_AUDIO_LIMIT_STATUS
+                      raise DecodedAudioLimitError, "Cannot decode #{path} through native FFmpeg: #{detail}"
+                    end
 
                     raise TranscriptionRuntimeError, "Cannot decode #{path} through native FFmpeg: #{detail}"
                   end
@@ -168,7 +167,7 @@ module Cohere
 
                   bytes = count * Fiddle::SIZEOF_FLOAT
                   if max_decoded_bytes && bytes > max_decoded_bytes
-                    raise TranscriptionRuntimeError,
+                    raise DecodedAudioLimitError,
                           "Native FFmpeg exceeded the configured decoded-audio memory limit for #{path}"
                   end
 

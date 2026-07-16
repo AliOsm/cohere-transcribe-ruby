@@ -200,6 +200,14 @@ endif()
 if(COHERE_TRANSCRIBE_CUDA)
     target_compile_definitions(crispasr PRIVATE GGML_USE_CUDA)
     target_link_libraries(crispasr PRIVATE ggml-cuda)
+    # Source gems are compiled on the destination machine. Preserve the exact
+    # toolkit library directory found by CMake so non-system CUDA installs
+    # (including tarball and environment-managed toolkits) remain loadable after
+    # RubyGems moves libcrispasr out of the build tree.
+    set_property(TARGET crispasr APPEND PROPERTY
+        BUILD_RPATH "${CUDAToolkit_LIBRARY_DIR}")
+    set_property(TARGET crispasr APPEND PROPERTY
+        INSTALL_RPATH "${CUDAToolkit_LIBRARY_DIR}")
 endif()
 
 if(MSVC)

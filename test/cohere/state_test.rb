@@ -219,6 +219,109 @@ module Cohere
         end
       end
 
+      def test_manifest_verification_returns_unverified_when_its_parent_changes
+        original_same_regular_entry = State::BoundDirectory.instance_method(:same_regular_entry?)
+        changed = false
+
+        Dir.mktmpdir("cohere-manifest-parent-change") do |directory|
+          root = Pathname(directory)
+          snapshot, output_paths, state_path, binding = published_manifest_fixture(root)
+          parent = binding.access_path
+          parked = root.join("parked-output")
+          State::BoundDirectory.define_method(:same_regular_entry?) do |name, expected_stat|
+            if name == "clip.txt" && !changed
+              changed = true
+              parent.rename(parked)
+              parent.mkdir
+            end
+            original_same_regular_entry.bind_call(self, name, expected_stat)
+          end
+
+          verification = State.verify_published_outputs(
+            source_snapshot: snapshot,
+            output_paths: output_paths,
+            state_path: state_path,
+            asr_contract_key: "asr",
+            render_contract_key: "render",
+            directory_binding: binding,
+            guard_bindings: [binding]
+          )
+
+          assert changed
+          refute verification.verified?
+          assert_match(/publication parent changed during verification/, verification.reason)
+        end
+      ensure
+        State::BoundDirectory.define_method(:same_regular_entry?, original_same_regular_entry) if original_same_regular_entry
+      end
+
+      def test_manifest_rechecks_its_parent_after_validating_the_output_set
+        original_mismatch_reason = State.method(:publication_mismatch_reason)
+        changed = false
+
+        Dir.mktmpdir("cohere-manifest-final-parent-check") do |directory|
+          root = Pathname(directory)
+          snapshot, output_paths, state_path, binding = published_manifest_fixture(root)
+          parent = binding.access_path
+          parked = root.join("parked-output")
+          State.define_singleton_method(:publication_mismatch_reason) do |*arguments, **keywords|
+            reason = original_mismatch_reason.call(*arguments, **keywords)
+            unless reason || changed
+              changed = true
+              parent.rename(parked)
+              parent.mkdir
+            end
+            reason
+          end
+
+          verification = State.verify_published_outputs(
+            source_snapshot: snapshot,
+            output_paths: output_paths,
+            state_path: state_path,
+            asr_contract_key: "asr",
+            render_contract_key: "render",
+            directory_binding: binding,
+            guard_bindings: [binding]
+          )
+
+          assert changed
+          refute verification.verified?
+          assert_match(/publication parent changed during verification/, verification.reason)
+        end
+      ensure
+        State.define_singleton_method(:publication_mismatch_reason, original_mismatch_reason) if original_mismatch_reason
+      end
+
+      def test_manifest_verification_propagates_unrelated_runtime_failures
+        original_same_regular_entry = State::BoundDirectory.instance_method(:same_regular_entry?)
+
+        Dir.mktmpdir("cohere-manifest-runtime-failure") do |directory|
+          root = Pathname(directory)
+          snapshot, output_paths, state_path, binding = published_manifest_fixture(root)
+          State::BoundDirectory.define_method(:same_regular_entry?) do |name, expected_stat|
+            raise TranscriptionRuntimeError, "unexpected verifier failure" if name == "clip.txt"
+
+            original_same_regular_entry.bind_call(self, name, expected_stat)
+          end
+
+          error = assert_raises(TranscriptionRuntimeError) do
+            State.verify_published_outputs(
+              source_snapshot: snapshot,
+              output_paths: output_paths,
+              state_path: state_path,
+              asr_contract_key: "asr",
+              render_contract_key: "render",
+              directory_binding: binding,
+              guard_bindings: [binding]
+            )
+          end
+
+          assert_equal "unexpected verifier failure", error.message
+        end
+      ensure
+        State::BoundDirectory.define_method(:same_regular_entry?, original_same_regular_entry) if original_same_regular_entry
+      end
+
       def test_publication_plan_uses_separate_checkpoint_and_manifest_contracts
         Dir.mktmpdir do |directory|
           root = Pathname(directory)
@@ -724,6 +827,49 @@ module Cohere
         end
       end
 
+      def test_lock_registry_uses_the_configured_and_default_cache_roots
+        Dir.mktmpdir("cohere-lock-cache-paths") do |directory|
+          root = Pathname(directory)
+          custom_cache = root.join("custom-cache")
+          with_lock_cache_environment("COHERE_TRANSCRIBE_CACHE" => custom_cache.to_s) do
+            assert_equal custom_cache.join("locks"), State.lock_registry_directory
+          end
+
+          xdg_cache = root.join("xdg-cache")
+          with_lock_cache_environment("XDG_CACHE_HOME" => xdg_cache.to_s) do
+            assert_equal xdg_cache.join("cohere-transcribe/locks"), State.lock_registry_directory
+          end
+
+          home = root.join("home")
+          with_lock_cache_environment("HOME" => home.to_s) do
+            assert_equal home.join(".cache/cohere-transcribe/locks"), State.lock_registry_directory
+          end
+        end
+      end
+
+      def test_output_lock_creates_a_nested_private_cache_registry
+        Dir.mktmpdir("cohere-lock-nested-cache") do |directory|
+          cache = Pathname(directory).join("nested/cache/cohere")
+          with_lock_cache_environment("COHERE_TRANSCRIBE_CACHE" => cache.to_s) do
+            target = State.lock_target_for_outputs(
+              "txt" => Pathname(directory).join("outputs/clip.txt")
+            )
+            assert_equal cache.join("locks"), target.path.dirname
+            refute cache.exist?
+
+            lock = State::OutputSetLock.acquire(target)
+            begin
+              assert_predicate target.path.dirname, :directory?
+              assert_equal 0, target.path.dirname.stat.mode & 0o077 unless Gem.win_platform?
+              assert_equal 23, run_lock_child(target)
+            ensure
+              lock.release
+            end
+            assert_equal 0, run_lock_child(target)
+          end
+        end
+      end
+
       def test_output_lock_contends_across_processes_and_releases
         Dir.mktmpdir do |directory|
           target = State.lock_target_for_outputs("txt" => Pathname(directory).join("clip.txt"))
@@ -879,6 +1025,41 @@ module Cohere
       end
 
       private
+
+      def with_lock_cache_environment(values)
+        names = %w[COHERE_TRANSCRIBE_CACHE XDG_CACHE_HOME HOME]
+        previous = names.to_h { |name| [name, ENV.fetch(name, nil)] }
+        names.each { |name| ENV.delete(name) }
+        values.each { |name, value| ENV[name] = value }
+        yield
+      ensure
+        previous&.each do |name, value|
+          value.nil? ? ENV.delete(name) : ENV[name] = value
+        end
+      end
+
+      def published_manifest_fixture(root)
+        source = root.join("clip.wav")
+        source.binwrite("audio")
+        snapshot = State::SourceSnapshot.capture(source)
+        parent = root.join("out")
+        parent.mkdir
+        output_paths = { "txt" => parent.join("clip.txt"), "json" => parent.join("clip.json") }
+        contents = { "txt" => "transcript\n", "json" => "{\"ok\":true}\n" }
+        contents.each { |format, content| output_paths.fetch(format).binwrite(content) }
+        state_path = State.state_path_for_outputs(output_paths)
+        state_path.binwrite(
+          State.published_manifest_content(
+            source_snapshot: snapshot,
+            output_paths: output_paths,
+            contents: contents,
+            asr_contract_key: "asr",
+            render_contract_key: "render",
+            generation_id: "generation"
+          )
+        )
+        [snapshot, output_paths, state_path, State::DirectoryBinding.capture(parent)]
+      end
 
       def rename_with_temporary_cleanup_failure
         lambda do |bound, source, destination, _phase|

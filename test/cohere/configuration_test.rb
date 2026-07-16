@@ -251,25 +251,52 @@ module Cohere
         assert_match(/Cannot resolve model path/, error.message)
       end
 
-      def test_binary_encoded_model_paths_are_accepted_locally_or_rejected_with_a_typed_error
+      def test_model_references_require_valid_utf8_bytes
         Dir.mktmpdir do |directory|
           binary_directory = File.join(directory.b, "model-\xE9".b)
           options = TranscriptionOptions.new(model: binary_directory)
-          begin
-            Dir.mkdir(binary_directory)
-          rescue Errno::EILSEQ
-            assert_raises(TranscriptionConfigurationError) do
-              Configuration.validate!(options)
-            end
-          else
-            assert_same options, Configuration.validate!(options)
+          error = assert_raises(TranscriptionConfigurationError) do
+            Configuration.validate!(options)
           end
+          assert_match(/--model must contain valid UTF-8/, error.message)
         end
 
         error = assert_raises(TranscriptionConfigurationError) do
           Configuration.validate!(TranscriptionOptions.new(model: "owner/mod\xE9l".b))
         end
-        assert_match(/valid Hugging Face repository ID or local directory/, error.message)
+        assert_match(/--model must contain valid UTF-8/, error.message)
+
+        error = assert_raises(TranscriptionConfigurationError) do
+          Configuration.validate!(
+            TranscriptionOptions.new(model_revision: "revis\xE9on".b)
+          )
+        end
+        assert_match(/--model-revision must contain valid UTF-8/, error.message)
+      end
+
+      def test_model_and_adapter_aliases_reject_non_utf8_canonical_paths
+        Dir.mktmpdir do |directory|
+          invalid_directory = File.join(directory.b, "checkpoint-\xE9".b)
+          begin
+            Dir.mkdir(invalid_directory)
+          rescue Errno::EILSEQ
+            skip "this filesystem cannot create the fixture path"
+          end
+
+          %i[model adapter].each do |option|
+            alias_path = File.join(directory, "#{option}-alias")
+            begin
+              File.symlink(File.basename(invalid_directory), alias_path)
+            rescue NotImplementedError, Errno::EPERM
+              skip "symbolic links are unavailable"
+            end
+
+            error = assert_raises(TranscriptionConfigurationError) do
+              Configuration.validate!(TranscriptionOptions.new(**{ option => alias_path }))
+            end
+            assert_match(/#{option.capitalize} resolved path must contain valid UTF-8/, error.message)
+          end
+        end
       end
 
       def test_path_like_model_must_resolve_to_text

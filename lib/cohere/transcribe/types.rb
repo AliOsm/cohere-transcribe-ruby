@@ -47,10 +47,21 @@ module Cohere
         immutable(array)
       end
 
-      def path(value)
+      def reference(value)
         source = value.respond_to?(:to_path) ? value.to_path : value
-        pathname = Pathname.new(source)
-        text = pathname.to_s
+        return immutable(value) unless source.is_a?(String)
+
+        text = source.b.dup.force_encoding(Encoding::UTF_8)
+        text.valid_encoding? ? text.freeze : immutable(source)
+      end
+
+      def path(value, field: "path")
+        source = value.respond_to?(:to_path) ? value.to_path : value
+        raise TypeError, "#{field} must resolve to a text path" unless source.is_a?(String)
+
+        text = source.b.dup.force_encoding(Encoding::UTF_8)
+        raise ArgumentError, "#{field} must contain valid UTF-8" unless text.valid_encoding?
+
         absolute = text.start_with?("/")
         prefix = if text.start_with?("//") && !text.start_with?("///")
                    "//"
@@ -84,9 +95,9 @@ module Cohere
 
         super(
           formats: formats,
-          output_dir: output_dir.nil? ? nil : TypesSupport.path(output_dir),
+          output_dir: output_dir.nil? ? nil : TypesSupport.path(output_dir, field: "output_dir"),
           existing: TypesSupport.immutable(existing),
-          profile_json: profile_json.nil? ? nil : TypesSupport.path(profile_json)
+          profile_json: profile_json.nil? ? nil : TypesSupport.path(profile_json, field: "profile_json")
         )
       end
     end
@@ -183,10 +194,10 @@ module Cohere
         publication: nil
       )
         super(
-          model: TypesSupport.immutable(model),
-          model_revision: TypesSupport.immutable(model_revision),
-          adapter: TypesSupport.immutable(adapter),
-          adapter_revision: TypesSupport.immutable(adapter_revision),
+          model: TypesSupport.reference(model),
+          model_revision: TypesSupport.reference(model_revision),
+          adapter: TypesSupport.reference(adapter),
+          adapter_revision: TypesSupport.reference(adapter_revision),
           language: TypesSupport.immutable(language),
           text_only: text_only,
           recursive: recursive,

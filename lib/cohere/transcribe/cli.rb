@@ -179,8 +179,8 @@ module Cohere
           parser.on("--adapter-revision REVISION", "Hub adapter commit, tag, or branch.") do |value|
             values[:adapter_revision] = value
           end
-          parser.on("--language LANGUAGE", String, %w[ar en], "Spoken language tag (ar or en).") do |value|
-            values[:language] = value
+          parser.on("--language LANGUAGE", String, "Spoken language tag (ar or en).") do |value|
+            values[:language] = exact_choice!("language", value, %w[ar en])
           end
           parser.on("--formats FORMAT [FORMAT ...]", String, "Outputs to write: txt, srt, vtt, json.") do |encoded|
             value = encoded.split(FORMAT_ARGUMENT_SEPARATOR, -1)
@@ -196,21 +196,20 @@ module Cohere
           end
           parser.on("--recursive", "Recurse into input directories (default).") { values[:recursive] = true }
           parser.on("--no-recursive", "Do not recurse into input directories.") { values[:recursive] = false }
-          parser.on("--existing POLICY", String, %w[error overwrite skip], "Existing outputs policy.") do |value|
-            values[:existing] = value
+          parser.on("--existing POLICY", String, "Existing outputs policy.") do |value|
+            values[:existing] = exact_choice!("existing", value, %w[error overwrite skip])
           end
-          parser.on("--device DEVICE", String, %w[auto mps cuda cpu], "Inference device.") do |value|
-            values[:device] = value
+          parser.on("--device DEVICE", String, "Inference device.") do |value|
+            values[:device] = exact_choice!("device", value, %w[auto mps cuda cpu])
           end
-          parser.on("--dtype DTYPE", String, %w[auto bf16 fp16 fp32], "ASR model precision.") do |value|
-            values[:dtype] = value
+          parser.on("--dtype DTYPE", String, "ASR model precision.") do |value|
+            values[:dtype] = exact_choice!("dtype", value, %w[auto bf16 fp16 fp32])
           end
           parser.on(
             "--audio-backend BACKEND",
             String,
-            %w[auto torchcodec ffmpeg librosa],
             "Audio decoder configuration."
-          ) { |value| values[:audio_backend] = value }
+          ) { |value| values[:audio_backend] = exact_choice!("audio-backend", value, %w[auto torchcodec ffmpeg librosa]) }
           parser.on("--audio-memory-gb GIB", String, "Decoded-PCM memory limit per file/group.") do |value|
             values[:audio_memory_gb] = parse_reference_float(value)
           end
@@ -226,11 +225,11 @@ module Cohere
 
           parser.separator("")
           parser.separator("Segmentation (VAD):")
-          parser.on("--vad MODE", String, %w[silero auditok none], "Segmentation policy.") do |value|
-            values[:vad] = value
+          parser.on("--vad MODE", String, "Segmentation policy.") do |value|
+            values[:vad] = exact_choice!("vad", value, %w[silero auditok none])
           end
-          parser.on("--vad-engine ENGINE", String, %w[auto torch onnx jit], "Silero runtime.") do |value|
-            values[:vad_engine] = value
+          parser.on("--vad-engine ENGINE", String, "Silero runtime.") do |value|
+            values[:vad_engine] = exact_choice!("vad-engine", value, %w[auto torch onnx jit])
           end
           parser.on("--vad-batch-size COUNT", String, "Maximum files per packed VAD call.") do |value|
             values[:vad_batch_size] = parse_reference_integer(value)
@@ -299,8 +298,8 @@ module Cohere
           parser.on("--max-retry-tokens COUNT", String, "Automatic retry token limit.") do |value|
             values[:max_retry_tokens] = parse_reference_integer(value)
           end
-          parser.on("--truncation-policy POLICY", String, %w[retry warn], "Token-limit behavior.") do |value|
-            values[:truncation_policy] = value
+          parser.on("--truncation-policy POLICY", String, "Token-limit behavior.") do |value|
+            values[:truncation_policy] = exact_choice!("truncation-policy", value, %w[retry warn])
           end
           parser.on("--stop-repetition-loops", "Stop conservative decoder repetition loops (default).") do
             values[:stop_repetition_loops] = true
@@ -311,9 +310,9 @@ module Cohere
 
           parser.separator("")
           parser.separator("Alignment and subtitle cues:")
-          parser.on("--alignment MODE", String, %w[word segment none], "Timestamp mode.") do |value|
+          parser.on("--alignment MODE", String, "Timestamp mode.") do |value|
             state[:alignment] = true
-            values[:alignment] = value
+            values[:alignment] = exact_choice!("alignment", value, %w[word segment none])
           end
           parser.on("--text-only", "Alias for --alignment none.") do
             state[:text_only] = true
@@ -322,8 +321,8 @@ module Cohere
           parser.on("--align-batch-size COUNT", String, "Maximum alignment windows per batch.") do |value|
             values[:align_batch_size] = parse_reference_integer(value)
           end
-          parser.on("--align-dtype DTYPE", String, %w[fp32 fp16], "Alignment precision.") do |value|
-            values[:align_dtype] = value
+          parser.on("--align-dtype DTYPE", String, "Alignment precision.") do |value|
+            values[:align_dtype] = exact_choice!("align-dtype", value, %w[fp32 fp16])
           end
           parser.on("--max-chars COUNT", String, "Target subtitle cue length.") do |value|
             values[:max_chars] = parse_reference_integer(value)
@@ -556,6 +555,14 @@ module Cohere
         end.flatten
       end
       private_class_method :defer_unknown_options_before_early_exit
+
+      def exact_choice!(option, value, choices)
+        return value if choices.include?(value)
+
+        raise OptionParser::InvalidArgument,
+              "--#{option}: invalid choice #{value.inspect}; choose from #{choices.join(", ")}"
+      end
+      private_class_method :exact_choice!
 
       def parse_reference_float(value)
         text = normalize_reference_numeric_text(value)

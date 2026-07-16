@@ -30,7 +30,7 @@ module Cohere
 
         def test_memory_limit_and_corrupt_input_fail_cleanly
           with_wav(frames: 400) do |path|
-            error = assert_raises(TranscriptionRuntimeError) do
+            error = assert_raises(DecodedAudioLimitError) do
               FFmpegNative.decode(
                 path,
                 sample_rate: SAMPLE_RATE,
@@ -183,16 +183,81 @@ module Cohere
           Fiddle.free(address) if defined?(address) && address && defined?(freed) && freed.empty?
         end
 
+        def test_native_limit_status_uses_the_typed_limit_error
+          decode = lambda do |_path, _sample_rate, _maximum, _output_slot, _count_slot, message, _capacity|
+            message[0, 13] = "memory limit\0"
+            FFmpegNative::DECODED_AUDIO_LIMIT_STATUS
+          end
+          library = fake_library(decode: decode, free: ->(_pointer) {})
+
+          error = assert_raises(DecodedAudioLimitError) do
+            library.decode("fixture.wav", sample_rate: SAMPLE_RATE, max_decoded_bytes: 4)
+          end
+          assert_match(/memory limit/, error.message)
+        end
+
+        def test_wrapper_limit_check_uses_the_typed_limit_error_and_frees_output
+          bytes = 2 * Fiddle::SIZEOF_FLOAT
+          address = Fiddle.malloc(bytes)
+          Fiddle::Pointer.new(address)[0, bytes] = [0.25, -0.25].pack("f*")
+          freed = []
+          decode = lambda do |_path, _sample_rate, _maximum, output_slot, count_slot, _message, _capacity|
+            output_slot[0, Fiddle::SIZEOF_VOIDP] = [address].pack("J")
+            count_slot[0, Fiddle::SIZEOF_INT64_T] = [2].pack("q")
+            0
+          end
+          library = fake_library(decode: decode, free: lambda { |pointer|
+            freed << pointer
+            Fiddle.free(pointer)
+          })
+
+          assert_raises(DecodedAudioLimitError) do
+            library.decode("fixture.wav", sample_rate: SAMPLE_RATE, max_decoded_bytes: Fiddle::SIZEOF_FLOAT)
+          end
+          assert_equal [address], freed
+        ensure
+          Fiddle.free(address) if defined?(address) && address && defined?(freed) && freed.empty?
+        end
+
+        def test_caller_interrupt_wins_when_the_decode_worker_fails_during_cleanup
+          started = Queue.new
+          release = Queue.new
+          cancel_calls = 0
+          decode = lambda do |*_arguments|
+            started << true
+            release.pop
+            raise "worker failure after cancellation"
+          end
+          cancel = lambda do
+            cancel_calls += 1
+            release << true if release.empty?
+          end
+          library = fake_library(decode: decode, free: ->(_pointer) {}, cancel: cancel)
+          caller = Thread.current
+          interrupter = Thread.new do
+            started.pop
+            caller.raise(Interrupt, "original caller interruption")
+          end
+
+          error = assert_raises(Interrupt) do
+            library.decode("fixture.wav", sample_rate: SAMPLE_RATE, max_decoded_bytes: 4)
+          end
+          assert_equal "original caller interruption", error.message
+          assert_operator cancel_calls, :>=, 1
+        ensure
+          interrupter&.join
+        end
+
         private
 
-        def fake_library(decode:, free:)
+        def fake_library(decode:, free:, cancel: -> {})
           FFmpegNative::Library.allocate.tap do |library|
             library.instance_variable_set(
               :@functions,
               {
                 decode: decode,
                 free: free,
-                cancel: -> {}
+                cancel: cancel
               }
             )
           end

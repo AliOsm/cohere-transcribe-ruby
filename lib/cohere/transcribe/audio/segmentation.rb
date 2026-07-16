@@ -33,6 +33,7 @@ module Cohere
             start_time = Float(raw_start)
             end_time = Float(raw_end)
             raise ArgumentError, "Segment #{index} has non-finite bounds" unless start_time.finite? && end_time.finite?
+            raise ArgumentError, "Segment #{index} has inverted bounds" if end_time < start_time
             if start_time < -tolerance || end_time > duration + tolerance
               raise ArgumentError,
                     format("Segment %<index>d lies outside the audio: %<start>.6f..%<end>.6f for %<duration>.6fs",

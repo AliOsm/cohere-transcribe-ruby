@@ -1,7 +1,9 @@
 # frozen_string_literal: true
 
 require "test_helper"
+require "json"
 require "socket"
+require "timeout"
 
 module Cohere
   module Transcribe
@@ -240,6 +242,173 @@ module Cohere
         end
       end
 
+      def test_successful_revision_lookups_are_memoized_briefly_then_revalidated
+        Dir.mktmpdir("cohere-hub-memo") do |directory|
+          commits = ["a" * 40, "b" * 40]
+          requests = 0
+          clock = 100.0
+          hub = Hub.new(cache_dir: directory, endpoint: "https://example.invalid")
+          hub.define_singleton_method(:monotonic) { clock }
+          hub.define_singleton_method(:request) do |_uri, **_options|
+            commit = commits.fetch(requests)
+            requests += 1
+            Struct.new(:body).new(JSON.generate("sha" => commit))
+          end
+
+          assert_equal commits[0], hub.resolve_revision("owner/model", "main")
+          assert_equal commits[0], hub.resolve_revision("owner/model", "main")
+          assert_equal 1, requests
+
+          clock += Hub.const_get(:RESOLUTION_MEMO_TTL_SECONDS)
+
+          assert_equal commits[1], hub.resolve_revision("owner/model", "main")
+          assert_equal 2, requests
+        end
+      end
+
+      def test_revision_memo_has_a_fixed_entry_limit
+        limit = Hub.const_get(:RESOLUTION_MEMO_LIMIT)
+        commit = "c" * 40
+        requests = 0
+        hub = Hub.new(endpoint: "https://example.invalid")
+        hub.define_singleton_method(:write_ref) { |_repo_id, _revision, _commit| nil }
+        hub.define_singleton_method(:request) do |_uri, **_options|
+          requests += 1
+          Struct.new(:body).new(JSON.generate("sha" => commit))
+        end
+
+        (limit + 1).times do |index|
+          assert_equal commit, hub.resolve_revision("owner/model#{index}", "main")
+        end
+        assert_equal commit, hub.resolve_revision("owner/model0", "main")
+
+        assert_equal limit + 2, requests
+        assert_equal limit, hub.instance_variable_get(:@resolution_memo).length
+      end
+
+      def test_concurrent_revision_lookups_share_one_request
+        Dir.mktmpdir("cohere-hub-coalescing") do |directory|
+          commit = "d" * 40
+          entered_request = Queue.new
+          release_request = Queue.new
+          waiter_entered = Queue.new
+          requests = 0
+          hub = Hub.new(cache_dir: directory, endpoint: "https://example.invalid")
+          hub.define_singleton_method(:request) do |_uri, **_options|
+            requests += 1
+            entered_request << true
+            release_request.pop
+            Struct.new(:body).new(JSON.generate("sha" => commit))
+          end
+
+          first = Thread.new { hub.resolve_revision("owner/model", "main") }
+          entered_request.pop
+          flight = hub.instance_variable_get(:@resolution_flights).values.fetch(0)
+          original_wait = flight.condition.method(:wait)
+          flight.condition.define_singleton_method(:wait) do |*arguments|
+            waiter_entered << true
+            original_wait.call(*arguments)
+          end
+          second = Thread.new { hub.resolve_revision("owner/model", "main") }
+          Timeout.timeout(2) { waiter_entered.pop }
+          release_request << true
+
+          assert_equal [commit, commit], [first.value, second.value]
+          assert_equal 1, requests
+        ensure
+          release_request << true
+          first&.join
+          second&.join
+        end
+      end
+
+      def test_warm_snapshot_is_reused_for_connection_failures_without_repeated_requests
+        Dir.mktmpdir("cohere-hub-connection-fallback") do |directory|
+          commit = cache_snapshot(directory)
+          clock = 100.0
+          requests = 0
+          hub = Hub.new(cache_dir: directory, endpoint: "https://example.invalid")
+          hub.define_singleton_method(:monotonic) { clock }
+          hub.define_singleton_method(:request) do |_uri, **_options|
+            requests += 1
+            raise Hub::ConnectionError, "fixture connection failure"
+          end
+
+          assert_equal commit, hub.resolve_revision("owner/model", "main")
+          assert_equal commit, hub.resolve_revision("owner/model", "main")
+          assert_equal 1, requests
+
+          clock += Hub.const_get(:RESOLUTION_MEMO_TTL_SECONDS)
+
+          assert_equal commit, hub.resolve_revision("owner/model", "main")
+          assert_equal 2, requests
+        end
+      end
+
+      def test_transient_http_failures_reuse_a_warm_snapshot
+        [429, 503].each do |status|
+          Dir.mktmpdir("cohere-hub-http-fallback") do |directory|
+            commit = cache_snapshot(directory)
+            hub = Hub.new(cache_dir: directory, endpoint: "https://example.invalid")
+            response = http_response(status)
+            hub.define_singleton_method(:request) do |uri, **_options|
+              send(:raise_http_error!, response, uri)
+            end
+
+            assert_equal commit, hub.resolve_revision("owner/model", "main"), status.to_s
+          end
+        end
+      end
+
+      def test_malformed_successful_responses_reuse_a_warm_snapshot
+        ["{", JSON.generate([]), JSON.generate("sha" => "short")].each do |body|
+          Dir.mktmpdir("cohere-hub-response-fallback") do |directory|
+            commit = cache_snapshot(directory)
+            hub = Hub.new(cache_dir: directory, endpoint: "https://example.invalid")
+            hub.define_singleton_method(:request) do |_uri, **_options|
+              Struct.new(:body).new(body)
+            end
+
+            assert_equal commit, hub.resolve_revision("owner/model", "main"), body
+          end
+        end
+      end
+
+      def test_definitive_http_failures_do_not_reuse_a_warm_snapshot
+        [[401, Hub::AuthenticationError], [403, Hub::AuthenticationError], [404, Hub::NotFoundError]].each do |status, error_class|
+          Dir.mktmpdir("cohere-hub-definitive-failure") do |directory|
+            cache_snapshot(directory)
+            hub = Hub.new(cache_dir: directory, endpoint: "https://example.invalid")
+            response = http_response(status)
+            hub.define_singleton_method(:request) do |uri, **_options|
+              send(:raise_http_error!, response, uri)
+            end
+
+            assert_raises(error_class, status.to_s) do
+              hub.resolve_revision("owner/model", "main")
+            end
+          end
+        end
+      end
+
+      def test_transient_lookup_memo_still_requires_the_requested_cached_file
+        Dir.mktmpdir("cohere-hub-fallback-file") do |directory|
+          commit = cache_snapshot(directory)
+          requests = 0
+          hub = Hub.new(cache_dir: directory, endpoint: "https://example.invalid")
+          hub.define_singleton_method(:request) do |_uri, **_options|
+            requests += 1
+            raise Hub::ConnectionError, "fixture connection failure"
+          end
+
+          assert_equal commit, hub.resolve_revision("owner/model", "main", filename: "config.json")
+          assert_raises(Hub::ConnectionError) do
+            hub.resolve_revision("owner/model", "main", filename: "weights.bin")
+          end
+          assert_equal 1, requests
+        end
+      end
+
       def test_offline_symbolic_revision_without_a_cached_snapshot_fails_without_a_request
         Dir.mktmpdir("cohere-hub-offline-missing") do |directory|
           hub = Hub.new(cache_dir: directory, offline: true)
@@ -325,6 +494,30 @@ module Cohere
           assert_equal "private", victim.read
           refute destination.exist?
         end
+      end
+
+      private
+
+      def cache_snapshot(directory, repo_id: "owner/model", revision: "main", filename: "config.json")
+        commit = "8" * 40
+        repository = Pathname(directory).join("models--#{repo_id.gsub("/", "--")}")
+        repository.join("refs").tap(&:mkpath).join(revision).tap do |path|
+          path.dirname.mkpath
+          path.write("#{commit}\n")
+        end
+        repository.join("snapshots", commit, filename).tap do |path|
+          path.dirname.mkpath
+          path.write("cached")
+        end
+        commit
+      end
+
+      def http_response(status)
+        response_class = Net::HTTPResponse::CODE_TO_OBJ.fetch(status.to_s)
+        response = response_class.new("1.1", status.to_s, "fixture response")
+        response.instance_variable_set(:@body, JSON.generate("error" => "fixture failure"))
+        response.instance_variable_set(:@read, true)
+        response
       end
     end
   end

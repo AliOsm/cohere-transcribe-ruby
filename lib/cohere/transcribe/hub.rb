@@ -17,9 +17,17 @@ module Cohere
       class ConnectionError < Error; end
       class AuthenticationError < Error; end
       class NotFoundError < Error; end
+      class TransientError < Error; end
 
       COMMIT_PATTERN = /\A[0-9a-f]{40}\z/i
       DEFAULT_ENDPOINT = "https://huggingface.co"
+      RESOLUTION_MEMO_TTL_SECONDS = 5.0
+      RESOLUTION_MEMO_LIMIT = 64
+      ResolutionMemo = Struct.new(:value, :error, :expires_at, keyword_init: true)
+      ResolutionFlight = Struct.new(:condition, :complete, :value, :error, keyword_init: true)
+
+      private_constant :TransientError, :RESOLUTION_MEMO_TTL_SECONDS, :RESOLUTION_MEMO_LIMIT,
+                       :ResolutionMemo, :ResolutionFlight
 
       attr_reader :cache_dir, :endpoint
 
@@ -29,7 +37,14 @@ module Cohere
         @endpoint = (endpoint || ENV.fetch("HF_ENDPOINT", DEFAULT_ENDPOINT)).sub(%r{/+\z}, "")
         @endpoint_uri = URI(@endpoint)
         @token = token || ENV["HF_TOKEN"] || cached_token(hf_home)
-        @offline = offline.nil? ? truthy_environment?(ENV.fetch("HF_HUB_OFFLINE", nil)) : !!offline
+        @offline = if offline.nil?
+                     truthy_environment?(ENV.fetch("HF_HUB_OFFLINE", nil))
+                   else
+                     !offline.equal?(false)
+                   end
+        @resolution_guard = Mutex.new
+        @resolution_memo = {}
+        @resolution_flights = {}
       end
 
       def offline?
@@ -42,33 +57,22 @@ module Cohere
         validate_revision!(requested)
         return requested.downcase if COMMIT_PATTERN.match?(requested)
 
-        cached = cached_revision(repo_id, requested, filename: filename)
         if offline?
+          cached = cached_revision(repo_id, requested, filename: filename)
           return cached if cached
 
           raise Error,
                 "Hub offline mode has no cached #{filename} snapshot for #{repo_id.inspect} at #{requested.inspect}"
         end
 
-        encoded_repo = repo_id.split("/").map { |part| URI.encode_www_form_component(part) }.join("/")
-        encoded_revision = URI.encode_www_form_component(requested)
         begin
-          response = request(URI("#{endpoint}/api/models/#{encoded_repo}/revision/#{encoded_revision}"))
-        rescue ConnectionError
+          resolve_online_revision(repo_id, requested)
+        rescue ConnectionError, TransientError
+          cached = cached_revision(repo_id, requested, filename: filename)
           raise unless cached
 
-          return cached
+          cached
         end
-        payload = JSON.parse(response.body)
-        commit = payload["sha"]
-        unless commit.is_a?(String) && COMMIT_PATTERN.match?(commit)
-          raise Error, "Hub returned no immutable commit for #{repo_id.inspect} at #{requested.inspect}"
-        end
-
-        write_ref(repo_id, requested, commit.downcase)
-        commit.downcase
-      rescue JSON::ParserError => e
-        raise Error, "Invalid Hub response while resolving #{repo_id.inspect}: #{e.message}"
       end
 
       def download(repo_id, filename, revision: nil)
@@ -146,6 +150,98 @@ module Cohere
       end
 
       private
+
+      def resolve_online_revision(repo_id, revision)
+        key = resolution_key(repo_id, revision)
+        flight = nil
+        @resolution_guard.synchronize do
+          prune_resolution_memo
+          memo = @resolution_memo[key]
+          return resolution_value(memo.value, memo.error) if memo
+
+          flight = @resolution_flights[key]
+          if flight
+            flight.condition.wait(@resolution_guard) until flight.complete
+            return resolution_value(flight.value, flight.error)
+          end
+
+          flight = ResolutionFlight.new(condition: ConditionVariable.new, complete: false)
+          @resolution_flights[key] = flight
+        end
+
+        value = error = nil
+        begin
+          value = fetch_online_revision(repo_id, revision)
+        rescue Exception => e # rubocop:disable Lint/RescueException -- every exit must release concurrent waiters
+          error = e
+          raise
+        ensure
+          Thread.handle_interrupt(Exception => :never) do
+            complete_resolution(key, flight, value, error)
+          end
+        end
+        value
+      end
+
+      def fetch_online_revision(repo_id, revision)
+        encoded_repo = repo_id.split("/").map { |part| URI.encode_www_form_component(part) }.join("/")
+        encoded_revision = URI.encode_www_form_component(revision)
+        response = request(URI("#{endpoint}/api/models/#{encoded_repo}/revision/#{encoded_revision}"))
+        payload = JSON.parse(response.body.to_s)
+        commit = payload.is_a?(Hash) ? payload["sha"] : nil
+        unless commit.is_a?(String) && COMMIT_PATTERN.match?(commit)
+          raise TransientError, "Hub returned no immutable commit for #{repo_id.inspect} at #{revision.inspect}"
+        end
+
+        commit = commit.downcase
+        write_ref(repo_id, revision, commit)
+        commit
+      rescue JSON::ParserError => e
+        raise TransientError, "Invalid Hub response while resolving #{repo_id.inspect}: #{e.message}"
+      end
+
+      def complete_resolution(key, flight, value, error)
+        @resolution_guard.synchronize do
+          if error.nil? || transient_resolution_error?(error)
+            @resolution_memo.delete(key)
+            @resolution_memo[key] = ResolutionMemo.new(
+              value: value,
+              error: error,
+              expires_at: monotonic + RESOLUTION_MEMO_TTL_SECONDS
+            )
+            @resolution_memo.shift while @resolution_memo.length > RESOLUTION_MEMO_LIMIT
+          end
+
+          flight.value = value
+          flight.error = error
+          flight.complete = true
+          @resolution_flights.delete(key)
+          flight.condition.broadcast
+        end
+      end
+
+      def resolution_value(value, error)
+        raise error if error
+
+        value
+      end
+
+      def transient_resolution_error?(error)
+        error.is_a?(ConnectionError) || error.is_a?(TransientError)
+      end
+
+      def prune_resolution_memo
+        now = monotonic
+        @resolution_memo.delete_if { |_key, entry| entry.expires_at <= now }
+      end
+
+      def resolution_key(repo_id, revision)
+        [repo_id.dup.freeze, revision.dup.freeze].freeze
+      end
+
+      def monotonic
+        Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      end
 
       def request(uri, stream: nil, redirects: 0)
         raise Error, "Hub offline mode prevents a request to #{uri}" if offline?
@@ -237,6 +333,7 @@ module Cohere
         case response.code.to_i
         when 401, 403 then raise AuthenticationError, message
         when 404 then raise NotFoundError, message
+        when 429, 500..599 then raise TransientError, message
         else raise Error, message
         end
       end

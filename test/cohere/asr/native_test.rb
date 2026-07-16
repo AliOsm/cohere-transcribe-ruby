@@ -288,6 +288,43 @@ class Cohere::Transcribe::NativeSessionTest < Minitest::Test
     end
   end
 
+  def test_empty_single_row_is_rejected_before_inference_without_poisoning_the_session
+    with_model_file do |path|
+      library = FakeLibrary.new
+      session = Cohere::Transcribe::ASR::NativeSession.new(
+        path,
+        Cohere::Transcribe::TranscriptionOptions.new(device: "cpu"),
+        library: library
+      )
+
+      error = assert_raises(ArgumentError) { session.transcribe([], language: "en") }
+      assert_match(/must not be empty/, error.message)
+      assert_nil library.sample_count
+      assert_equal "hello world", session.transcribe([0.0], language: "en").text
+    ensure
+      session&.close
+    end
+  end
+
+  def test_empty_batch_row_is_rejected_before_inference_without_poisoning_the_session
+    with_model_file do |path|
+      library = FakeLibrary.new
+      session = Cohere::Transcribe::ASR::NativeSession.new(
+        path,
+        Cohere::Transcribe::TranscriptionOptions.new(device: "cpu"),
+        library: library
+      )
+
+      error = assert_raises(ArgumentError) do
+        session.transcribe_batch([[0.0], []], language: "en")
+      end
+      assert_match(/batch row 1 must not be empty/, error.message)
+      assert_equal 2, session.transcribe_batch([[0.0], [0.1]], language: "en").length
+    ensure
+      session&.close
+    end
+  end
+
   def test_gc_closes_an_abandoned_native_session_exactly_once
     with_model_file do |path|
       library = FakeLibrary.new
