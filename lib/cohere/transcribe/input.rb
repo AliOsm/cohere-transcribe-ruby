@@ -34,12 +34,12 @@ module Cohere
           raise TranscriptionInputError, "#{label} must not be empty" if PythonText.blank?(text)
 
           text.dup.freeze
-        rescue TypeError, ArgumentError, SystemCallError => e
+        rescue EncodingError, TypeError, ArgumentError, SystemCallError => e
           raise e if e.is_a?(TranscriptionInputError)
 
           raise TranscriptionInputError, "#{label} is not a valid text path: #{e.message}"
         end.freeze
-      rescue TypeError, ArgumentError, SystemCallError => e
+      rescue EncodingError, TypeError, ArgumentError, SystemCallError => e
         raise e if e.is_a?(TranscriptionInputError)
 
         raise TranscriptionInputError, "audio is not a valid ordered path sequence: #{e.message}"
@@ -86,7 +86,7 @@ module Cohere
         paths.sort_by { |path| path.to_s.downcase(:fold) }.map do |path|
           [strict_realpath(path), path.relative_path_from(source)]
         end
-      rescue SystemCallError, ArgumentError => e
+      rescue EncodingError, SystemCallError, ArgumentError => e
         raise TranscriptionInputError, "Cannot inspect input #{source}: #{e.message}"
       end
       private_class_method :directory_candidates
@@ -95,7 +95,7 @@ module Cohere
         Pathname(value).expand_path.realpath
       rescue Errno::ENOENT
         raise TranscriptionInputError, "Input does not exist: #{Pathname(value).expand_path}"
-      rescue SystemCallError, ArgumentError => e
+      rescue EncodingError, SystemCallError, ArgumentError => e
         detail = e.is_a?(Errno::ELOOP) ? "Symlink loop" : e.message
         raise TranscriptionInputError, "Invalid input path #{value.inspect}: #{detail}"
       end

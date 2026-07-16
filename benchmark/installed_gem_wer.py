@@ -620,7 +620,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--ruby", type=Path, default=Path(shutil.which("ruby") or "ruby"))
     parser.add_argument("--gem-home", type=Path, required=True)
     parser.add_argument("--gem-artifact", type=Path, required=True)
-    parser.add_argument("--gem-version", default="0.1.1")
+    parser.add_argument("--gem-version", default="0.1.2")
     parser.add_argument("--native-library", type=Path, required=True)
     parser.add_argument("--audio-library", type=Path, required=True)
     parser.add_argument("--reference", action="append", default=[])

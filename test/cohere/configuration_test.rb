@@ -251,6 +251,21 @@ module Cohere
         assert_match(/Cannot resolve model path/, error.message)
       end
 
+      def test_binary_encoded_model_paths_are_accepted_locally_or_rejected_with_a_typed_error
+        Dir.mktmpdir do |directory|
+          binary_directory = File.join(directory.b, "model-\xE9".b)
+          Dir.mkdir(binary_directory)
+          options = TranscriptionOptions.new(model: binary_directory)
+
+          assert_same options, Configuration.validate!(options)
+        end
+
+        error = assert_raises(TranscriptionConfigurationError) do
+          Configuration.validate!(TranscriptionOptions.new(model: "owner/mod\xE9l".b))
+        end
+        assert_match(/valid Hugging Face repository ID or local directory/, error.message)
+      end
+
       def test_path_like_model_must_resolve_to_text
         path_like = Object.new
         path_like.define_singleton_method(:to_path) { 123 }

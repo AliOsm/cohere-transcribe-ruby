@@ -12,7 +12,7 @@ The gemspec should register `ext/cohere_transcribe_native/extconf.rb` in `spec.e
 
 Packaged builds define `GGML_BACKTRACE_NO_DEBUGGER`: fatal ggml diagnostics use the platform's in-process backtrace implementation and never fork or execute `gdb`/`lldb`. The upstream debugger-attaching behavior remains unchanged when the vendored ggml snapshot is built outside this gem's CMake project.
 
-CPU is the default. Optional build flags are:
+CPU is the default. Source builds require CMake 3.15 or newer and a C++20 compiler. CUDA builds require CMake 3.18 or newer. Optional build flags are:
 
 - `COHERE_TRANSCRIBE_NATIVE=1`: tune CPU code for the build machine.
 - `COHERE_TRANSCRIBE_OPENMP=1`: enable OpenMP.

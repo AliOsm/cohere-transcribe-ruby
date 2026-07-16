@@ -506,6 +506,21 @@ class Cohere::Transcribe::CLITest < Minitest::Test
     assert_includes out.string, "Interrupted"
   end
 
+  def test_interrupt_during_argument_parsing_maps_to_130_before_configuration_loads
+    script = <<~RUBY
+      require "stringio"
+      require "cohere/transcribe/cli"
+      Cohere::Transcribe::CLI.define_singleton_method(:parse_args) { |*, **| raise Interrupt }
+      output = StringIO.new
+      status = Cohere::Transcribe::CLI.main([], out: output, err: StringIO.new)
+      abort "wrong status: \#{status}" unless status == 130
+      abort "missing interrupt message" unless output.string.include?("Interrupted")
+    RUBY
+    _output, error, status = Open3.capture3("ruby", "-Ilib", "-e", script, chdir: project_root)
+
+    assert_predicate status, :success?, error
+  end
+
   def test_sigterm_maps_to_143_and_other_signals_are_reraised
     term = ->(*, **) { raise SignalException.new("TERM") }
     out = StringIO.new

@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.14...3.31)
+cmake_minimum_required(VERSION 3.15...3.31)
 
 project(cohere_transcribe_native VERSION 0.8.9 LANGUAGES C CXX)
 

@@ -10,6 +10,10 @@ module Cohere
       LEADING_WHITESPACE = /\A#{WHITESPACE_CLASS}+/u
       TRAILING_WHITESPACE = /#{WHITESPACE_CLASS}+\z/u
       WHITESPACE_RUN = /#{WHITESPACE_CLASS}+/u
+      BINARY_WHITESPACE_CLASS = "[\x09-\x0D\x1C-\x20]"
+      BINARY_LEADING_WHITESPACE = /\A#{BINARY_WHITESPACE_CLASS}+/n
+      BINARY_TRAILING_WHITESPACE = /#{BINARY_WHITESPACE_CLASS}+\z/n
+      BINARY_WHITESPACE_RUN = /#{BINARY_WHITESPACE_CLASS}+/n
       # Python 3.12 uses Unicode 15.0. Ruby 4 recognizes a small Unicode 16
       # set whose newly assigned case/compatibility mappings would otherwise
       # make the same input normalize differently from the reference package.
@@ -21,12 +25,15 @@ module Cohere
         *(0x1CCD6..0x1CCF9)
       ].to_h { |codepoint| [codepoint, true] }.freeze
       private_constant :WHITESPACE_CLASS, :LEADING_WHITESPACE, :TRAILING_WHITESPACE, :WHITESPACE_RUN,
+                       :BINARY_WHITESPACE_CLASS, :BINARY_LEADING_WHITESPACE, :BINARY_TRAILING_WHITESPACE,
+                       :BINARY_WHITESPACE_RUN,
                        :UNICODE_15_NORMALIZATION_BOUNDARIES
 
       module_function
 
       def strip(value)
-        value.sub(LEADING_WHITESPACE, "").sub(TRAILING_WHITESPACE, "")
+        leading, trailing, = whitespace_patterns(value)
+        value.sub(leading, "").sub(trailing, "")
       end
 
       def blank?(value)
@@ -35,11 +42,13 @@ module Cohere
 
       def split(value)
         stripped = strip(value)
-        stripped.empty? ? [] : stripped.split(WHITESPACE_RUN)
+        _, _, run = whitespace_patterns(stripped)
+        stripped.empty? ? [] : stripped.split(run)
       end
 
       def collapse(value)
-        strip(value.gsub(WHITESPACE_RUN, " "))
+        _, _, run = whitespace_patterns(value)
+        strip(value.gsub(run, " "))
       end
 
       def nfkc_lower(value)
@@ -64,6 +73,15 @@ module Cohere
       def whitespace_class
         WHITESPACE_CLASS
       end
+
+      def whitespace_patterns(value)
+        if value.encoding == Encoding::ASCII_8BIT
+          [BINARY_LEADING_WHITESPACE, BINARY_TRAILING_WHITESPACE, BINARY_WHITESPACE_RUN]
+        else
+          [LEADING_WHITESPACE, TRAILING_WHITESPACE, WHITESPACE_RUN]
+        end
+      end
+      private_class_method :whitespace_patterns
     end
     private_constant :PythonText
   end

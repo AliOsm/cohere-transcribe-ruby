@@ -61,4 +61,23 @@ jobs:
         run: bundle exec rake
 
       - name: Build the source gem
-        run: gem build cohere-transcribe.gemspec
+        id: gem
+        run: |
+          version=$(ruby -Ilib -rcohere/transcribe/version -e 'print Cohere::Transcribe::VERSION')
+          gem build cohere-transcribe.gemspec
+          gem_path="$PWD/cohere-transcribe-${version}.gem"
+          test -f "$gem_path"
+          echo "path=$gem_path" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Install and verify the source gem
+        env:
+          COHERE_TRANSCRIBE_NATIVE_JOBS: "2"
+        run: |
+          install_root="$RUNNER_TEMP/cohere-transcribe-gem"
+          gem install "${{ steps.gem.outputs.path }}" --install-dir "$install_root" --ignore-dependencies --no-document
+          gem_root="$install_root/gems/cohere-transcribe-${{ steps.gem.outputs.version }}"
+          test -d "$gem_root"
+          ruby "$gem_root/ext/cohere_transcribe_native/test/abi_smoke.rb" "$gem_root/lib/cohere/transcribe/native"
+          ruby -I"$gem_root/lib" -e 'require "cohere/transcribe"; abort "version mismatch" unless Cohere::Transcribe::VERSION == ARGV.fetch(0)' "${{ steps.gem.outputs.version }}"
+          ruby -I"$gem_root/lib" "$gem_root/exe/cohere-transcribe-doctor" --help >/dev/null

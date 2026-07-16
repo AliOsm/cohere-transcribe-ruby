@@ -297,6 +297,50 @@ module Cohere
           4 => :error
         }.freeze
 
+        # Keeps the native pointer independently of the Ruby session wrapper so
+        # ObjectSpace cleanup never retains the object it is meant to collect.
+        # Taking the pointer before calling the foreign close function makes
+        # explicit close, constructor rollback, and finalization idempotent.
+        class SessionOwnership
+          def initialize(library)
+            @library = library
+            @mutex = Mutex.new
+            @session = nil
+          end
+
+          def install(session)
+            @mutex.synchronize do
+              raise TranscriptionRuntimeError, "Native session ownership is already installed" if @session
+
+              @session = session
+            end
+          end
+
+          def close
+            session = @mutex.synchronize do
+              current = @session
+              @session = nil
+              current
+            end
+            return unless session
+
+            @library.call(:session_close, session)
+            nil
+          end
+
+          def finalize
+            close
+          rescue Exception # rubocop:disable Lint/RescueException -- finalizers must not escape during GC or shutdown
+            nil
+          end
+        end
+        private_constant :SessionOwnership
+
+        def self.finalizer_for(ownership)
+          proc { |_object_id| ownership.finalize }
+        end
+        private_class_method :finalizer_for
+
         attr_reader :backend, :batch_capacity, :compute_backend, :device, :last_batch_metrics, :model_path
 
         def initialize(model_path, options, threads: nil, library: NativeLibrary.load)
@@ -306,12 +350,24 @@ module Cohere
 
           @mutex = Mutex.new
           @closed = false
-          thread_count = normalize_threads(threads)
-          @session = @library.open_session(
-            model_path: @model_path,
-            device: options.device.to_s,
-            threads: thread_count
+          @session_ownership = SessionOwnership.new(@library)
+          ObjectSpace.define_finalizer(
+            self,
+            self.class.send(:finalizer_for, @session_ownership)
           )
+          thread_count = normalize_threads(threads)
+          # An asynchronous exception may become deliverable immediately after
+          # the foreign open returns. Defer it until the pointer belongs to the
+          # independent cleanup state, then let the constructor rescue close it.
+          Thread.handle_interrupt(Exception => :never) do
+            session = @library.open_session(
+              model_path: @model_path,
+              device: options.device.to_s,
+              threads: thread_count
+            )
+            @session_ownership.install(session)
+            @session = session
+          end
           @default_max_new_tokens = Integer(options.max_new_tokens)
           @library.call(:session_set_max_new_tokens, @session, @default_max_new_tokens)
           @library.call(:session_set_beam_size, @session, 1)
@@ -341,8 +397,12 @@ module Cohere
             close
             raise TranscriptionRuntimeError, "Native runtime reported an invalid Cohere batch capacity"
           end
-        rescue StandardError
-          close if defined?(@session) && @session
+        rescue Exception # rubocop:disable Lint/RescueException -- native ownership must roll back on Interrupt too
+          begin
+            close if defined?(@session_ownership)
+          rescue Exception # rubocop:disable Lint/RescueException -- preserve the constructor failure
+            nil
+          end
           raise
         end
 
@@ -449,9 +509,13 @@ module Cohere
           @mutex.synchronize do
             return if @closed
 
-            @library.call(:session_close, @session) if @library && @session
             @session = nil
             @closed = true
+            begin
+              @session_ownership&.close
+            ensure
+              ObjectSpace.undefine_finalizer(self)
+            end
           end
           nil
         end

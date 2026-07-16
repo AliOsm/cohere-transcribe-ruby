@@ -208,7 +208,7 @@ module Cohere
             path.write("cached config")
           end
           File.symlink(Pathname("../../blobs/config"), snapshot.join("config.json"))
-          hub = Hub.new(cache_dir: directory, endpoint: "https://example.invalid")
+          hub = Hub.new(cache_dir: directory, endpoint: "https://example.invalid", offline: true)
           hub.define_singleton_method(:request) do |*_args, **_options|
             raise "offline cache reuse must not contact the network"
           end
@@ -216,6 +216,38 @@ module Cohere
           assert_equal commit, hub.resolve_revision("owner/model", "main")
           assert_equal blob.realpath,
                        hub.download("owner/model", "config.json", revision: "main").realpath
+        end
+      end
+
+      def test_symbolic_revision_is_revalidated_online_and_updates_the_cached_ref
+        Dir.mktmpdir("cohere-hub-refresh") do |directory|
+          old_commit = "8" * 40
+          new_commit = "9" * 40
+          repository = Pathname(directory).join("models--owner--model")
+          repository.join("refs").tap(&:mkpath).join("main").write("#{old_commit}\n")
+          snapshot = repository.join("snapshots", old_commit).tap(&:mkpath)
+          snapshot.join("config.json").write("cached config")
+          requests = []
+          hub = Hub.new(cache_dir: directory, endpoint: "https://example.invalid")
+          hub.define_singleton_method(:request) do |uri, **_options|
+            requests << uri
+            Struct.new(:body).new(JSON.generate("sha" => new_commit))
+          end
+
+          assert_equal new_commit, hub.resolve_revision("owner/model", "main")
+          assert_equal 1, requests.length
+          assert_equal new_commit, repository.join("refs/main").read.strip
+        end
+      end
+
+      def test_offline_symbolic_revision_without_a_cached_snapshot_fails_without_a_request
+        Dir.mktmpdir("cohere-hub-offline-missing") do |directory|
+          hub = Hub.new(cache_dir: directory, offline: true)
+
+          error = assert_raises(Hub::Error) do
+            hub.resolve_revision("owner/model", "main")
+          end
+          assert_match(/offline mode has no cached/, error.message)
         end
       end
 

@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.2] - 2026-07-16
+
+- Correct macOS creation-mode delivery for descriptor-relative staged files and turn concurrent output replacement during preflight into a normal reprocessing decision.
+- Correct ZIP and ZIP64 boundary handling, verify streamed PyTorch tensor storage checksums before conversion, and make vocabulary validation bounded for malformed declared shapes.
+- Close abandoned and partially constructed native sessions exactly once, release native decoder metadata allocations deterministically, and guarantee decoded FFmpeg buffers are released when interruption arrives at the native return boundary.
+- Make preparation groups size-aware so long files retain the full single-file memory ceiling without overlapping another group, unify stereo downmix energy across audio backends, and return typed public errors for binary-encoded Unix paths.
+- Keep diagnostics and early command-line interruption contained, revalidate symbolic Hub revisions while online with an explicit offline cache mode, require CMake 3.15+, and install and exercise the built source gem on both CI platforms.
+
 ## [0.1.1] - 2026-07-15
 
 - Fix CUDA source-gem installation across Unix Makefiles and Ninja by making NVCC's generated response file available from each compiler working directory, including when the gem is installed beneath a path containing spaces.

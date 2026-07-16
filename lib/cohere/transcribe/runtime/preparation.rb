@@ -10,6 +10,7 @@ module Cohere
       module Preparation
         MAX_PIPELINE_GROUP_BYTES = 512 * (1024**2)
         MAX_GROUP_JOBS = 128
+        ESTIMATE_HEADROOM = 0.05
 
         # The result of decode and VAD preparation. Timings are accumulated by
         # the engine on the consuming thread, keeping statistics deterministic.
@@ -29,12 +30,16 @@ module Cohere
         # Bounded ordered preparation with at most one group ahead of ASR.
         #
         # A pipelined group receives at most half of the configured decoded-PCM
-        # budget (and never more than 512 MiB). Jobs inside it divide that cap,
-        # so the current and one in-flight next group cannot together exceed the
-        # configured PCM budget. Native decoder implementation transients are
-        # outside this retained-PCM accounting, as they are in the Python path.
+        # budget (and never more than 512 MiB). Estimated decode sizes determine
+        # group membership and per-file ceilings. A file that cannot fit that cap
+        # is prepared alone with the full configured ceiling and without overlap.
+        # Native decoder implementation transients are outside this retained-PCM
+        # accounting, as they are in the Python path.
         class Pipeline
           include Enumerable
+
+          Group = Data.define(:items, :limits, :exclusive)
+          private_constant :Group
 
           class WorkerPool
             STOP = Object.new.freeze
@@ -60,10 +65,10 @@ module Cohere
               end
             end
 
-            def prepare(group, per_file_limit)
-              responses = group.each_with_index.map do |item, slot|
+            def prepare(group)
+              responses = group.items.each_with_index.map do |item, slot|
                 response = Queue.new
-                @queues.fetch(slot) << [item, per_file_limit, response]
+                @queues.fetch(slot) << [item, group.limits.fetch(slot), response]
                 response
               end
               responses.map do |response|
@@ -88,7 +93,8 @@ module Cohere
 
           attr_reader :effective_workers, :group_byte_limit, :memory_byte_limit, :wait_seconds
 
-          def initialize(items, memory_byte_limit:, requested_workers:, enabled:, worker_limit: nil, &prepare)
+          def initialize(items, memory_byte_limit:, requested_workers:, enabled:, worker_limit: nil,
+                         estimate_bytes: nil, &prepare)
             raise ArgumentError, "prepare block is required" unless prepare
 
             @items = items.to_a.freeze
@@ -96,6 +102,7 @@ module Cohere
             raise ArgumentError, "memory_byte_limit must be positive" unless @memory_byte_limit.positive?
 
             @prepare = prepare
+            @estimate_bytes = estimate_bytes
             @wait_seconds = 0.0
             @enabled = enabled && @items.length > 1
             @worker_limit = worker_limit.nil? ? nil : Integer(worker_limit)
@@ -122,14 +129,16 @@ module Cohere
               return
             end
 
-            groups = @items.each_slice(@effective_workers).to_a
+            groups = build_groups
             pool = WorkerPool.new(@effective_workers, &@prepare)
             pending = submit(groups.first, 0, pool)
-            groups.each_with_index do |_group, group_index|
+            groups.each_with_index do |group, group_index|
               prepared = resolve(pending)
               pending = nil
-              pending = submit(groups.fetch(group_index + 1), group_index + 1, pool) if group_index + 1 < groups.length
+              next_group = groups[group_index + 1]
+              pending = submit(next_group, group_index + 1, pool) if next_group && !group.exclusive && !next_group.exclusive
               consume(prepared, &block)
+              pending ||= submit(next_group, group_index + 1, pool) if next_group
             end
             completed = true
           ensure
@@ -179,8 +188,67 @@ module Cohere
           end
 
           def prepare_group(group, pool)
-            per_file_limit = [@group_byte_limit / group.length, 1].max
-            pool.prepare(group, per_file_limit)
+            pool.prepare(group)
+          end
+
+          def build_groups
+            return equal_groups unless @estimate_bytes
+
+            groups = []
+            items = []
+            estimates = []
+            @items.each do |item|
+              estimate = estimated_reservation(item)
+              if estimate.nil? || estimate > @group_byte_limit
+                groups << bounded_group(items, estimates) unless items.empty?
+                groups << Group.new(items: [item].freeze, limits: [@memory_byte_limit].freeze, exclusive: true)
+                items = []
+                estimates = []
+                next
+              end
+
+              if items.length >= @effective_workers || estimates.sum + estimate > @group_byte_limit
+                groups << bounded_group(items, estimates)
+                items = []
+                estimates = []
+              end
+              items << item
+              estimates << estimate
+            end
+            groups << bounded_group(items, estimates) unless items.empty?
+            groups
+          end
+
+          def equal_groups
+            @items.each_slice(@effective_workers).map do |items|
+              limit = [@group_byte_limit / items.length, 1].max
+              Group.new(items: items.freeze, limits: Array.new(items.length, limit).freeze, exclusive: false)
+            end
+          end
+
+          def estimated_reservation(item)
+            value = @estimate_bytes.call(item)
+            return if value.nil?
+
+            bytes = Integer(value)
+            return unless bytes.positive?
+
+            [(bytes * (1.0 + ESTIMATE_HEADROOM)).ceil, 1].max
+          rescue ArgumentError, TypeError, SystemCallError
+            nil
+          end
+
+          def bounded_group(items, estimates)
+            limits = estimates.dup
+            remaining = @group_byte_limit - limits.sum
+            if remaining.positive?
+              weight = limits.sum
+              extras = limits.map { |limit| (remaining * limit).div(weight) }
+              leftover = remaining - extras.sum
+              extras[limits.each_index.max_by { |index| limits.fetch(index) }] += leftover
+              limits = limits.each_index.map { |index| limits.fetch(index) + extras.fetch(index) }
+            end
+            Group.new(items: items.freeze, limits: limits.freeze, exclusive: false)
           end
 
           def consume(prepared, &block)

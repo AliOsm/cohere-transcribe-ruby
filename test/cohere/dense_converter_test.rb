@@ -5,6 +5,7 @@ require_relative "../../lib/cohere/transcribe/dense_converter"
 require_relative "converter_test_support"
 
 require "tmpdir"
+require "timeout"
 
 class DenseConverterTest < Minitest::Test
   include ConverterTestSupport
@@ -183,7 +184,62 @@ class DenseConverterTest < Minitest::Test
     end
   end
 
+  def test_rejects_zero_width_and_unrepresentable_embedding_vocabulary_shapes_before_loading_tokenizer
+    Dir.mktmpdir do |directory|
+      shapes = [
+        [12, 0],
+        [Converter::MAX_VOCABULARY_SIZE + 1, 2]
+      ]
+
+      shapes.each do |shape|
+        converter = converter_with_embedding_shape(directory, shape)
+        error = assert_raises(Converter::Error) { converter.send(:load_vocabulary) }
+
+        assert_match(/invalid vocabulary shape/, error.message)
+        assert_includes error.message, shape.inspect
+      end
+      refute File.exist?(File.join(directory, "tokenizer.json"))
+    end
+  end
+
+  def test_vocabulary_completeness_check_is_bounded_by_tokenizer_entries
+    Dir.mktmpdir do |directory|
+      File.write(
+        File.join(directory, "tokenizer.json"),
+        JSON.generate(
+          "model" => { "vocab" => { "first" => 0 } },
+          "added_tokens" => []
+        )
+      )
+      converter = converter_with_embedding_shape(
+        directory,
+        [Converter::MAX_VOCABULARY_SIZE, 2]
+      )
+
+      error = Timeout.timeout(2) do
+        assert_raises(Converter::Error) { converter.send(:load_vocabulary) }
+      end
+
+      assert_equal(
+        "tokenizer.json vocabulary has missing token IDs: #{(1..8).to_a.inspect}",
+        error.message
+      )
+    end
+  end
+
   private
+
+  def converter_with_embedding_shape(directory, shape)
+    tensor = Struct.new(:name, :shape).new(
+      "transf_decoder._embedding.token_embedding.weight",
+      shape
+    )
+    tensor_set = Object.new
+    tensor_set.define_singleton_method(:fetch_any) { |_names| tensor }
+    converter = Converter.new(directory, output_path: File.join(directory, "fixture.gguf"))
+    converter.instance_variable_set(:@tensor_set, tensor_set)
+    converter
+  end
 
   def validate_model_config!(config)
     converter = Converter.new("fixture-model", output_path: "fixture.gguf")

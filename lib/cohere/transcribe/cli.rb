@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "optparse"
+require_relative "errors"
 require_relative "version"
 
 module Cohere

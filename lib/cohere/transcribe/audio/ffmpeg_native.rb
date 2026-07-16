@@ -111,6 +111,28 @@ module Cohere
           end
 
           def decode(path, sample_rate:, max_decoded_bytes:)
+            worker = Thread.new do
+              decode_owned(path, sample_rate: sample_rate, max_decoded_bytes: max_decoded_bytes)
+            end
+            worker.name = "cohere-ffmpeg-decode" if worker.respond_to?(:name=)
+            worker.report_on_exception = false
+            completed = false
+            result = worker.value
+            completed = true
+            result
+          ensure
+            if defined?(worker) && worker && !completed
+              Thread.handle_interrupt(Exception => :never) do
+                @functions.fetch(:cancel).call if worker.alive?
+              rescue StandardError
+                nil
+              ensure
+                worker.join
+              end
+            end
+          end
+
+          def decode_owned(path, sample_rate:, max_decoded_bytes:)
             output_slot = Fiddle::Pointer.malloc(Fiddle::SIZEOF_VOIDP, Fiddle::RUBY_FREE)
             output_slot[0, Fiddle::SIZEOF_VOIDP] = [0].pack("J")
             count_slot = Fiddle::Pointer.malloc(Fiddle::SIZEOF_INT64_T, Fiddle::RUBY_FREE)
@@ -119,46 +141,51 @@ module Cohere
             message[0, ERROR_CAPACITY] = "\0" * ERROR_CAPACITY
             maximum = max_decoded_bytes || 0
 
-            status = @functions.fetch(:decode).call(
-              c_string(path.to_s),
-              sample_rate,
-              maximum,
-              output_slot,
-              count_slot,
-              message,
-              ERROR_CAPACITY
-            )
-            address = output_slot[0, Fiddle::SIZEOF_VOIDP].unpack1("J")
-            count = count_slot[0, Fiddle::SIZEOF_INT64_T].unpack1("q")
-            detail = message.to_s.force_encoding(Encoding::UTF_8).scrub
-            unless status.zero?
-              @functions.fetch(:free).call(address) unless address.zero?
-              raise Interrupt, "Native FFmpeg decode was cancelled for #{path}: #{detail}" if status == CANCELLED_STATUS
+            address = 0
+            Thread.handle_interrupt(Exception => :never) do
+              status = @functions.fetch(:decode).call(
+                c_string(path.to_s),
+                sample_rate,
+                maximum,
+                output_slot,
+                count_slot,
+                message,
+                ERROR_CAPACITY
+              )
+              address = output_slot[0, Fiddle::SIZEOF_VOIDP].unpack1("J")
+              begin
+                Thread.handle_interrupt(Exception => :immediate) do
+                  count = count_slot[0, Fiddle::SIZEOF_INT64_T].unpack1("q")
+                  detail = message.to_s.force_encoding(Encoding::UTF_8).scrub
+                  unless status.zero?
+                    raise Interrupt, "Native FFmpeg decode was cancelled for #{path}: #{detail}" if status == CANCELLED_STATUS
 
-              raise TranscriptionRuntimeError, "Cannot decode #{path} through native FFmpeg: #{detail}"
-            end
-            if count.negative? || (count.positive? && address.zero?)
-              @functions.fetch(:free).call(address) unless address.zero?
-              raise TranscriptionRuntimeError, "Native FFmpeg returned invalid output metadata for #{path}"
-            end
-            bytes = count * Fiddle::SIZEOF_FLOAT
-            if max_decoded_bytes && bytes > max_decoded_bytes
-              @functions.fetch(:free).call(address) unless address.zero?
-              raise TranscriptionRuntimeError,
-                    "Native FFmpeg exceeded the configured decoded-audio memory limit for #{path}"
-            end
+                    raise TranscriptionRuntimeError, "Cannot decode #{path} through native FFmpeg: #{detail}"
+                  end
+                  if count.negative? || (count.positive? && address.zero?)
+                    raise TranscriptionRuntimeError, "Native FFmpeg returned invalid output metadata for #{path}"
+                  end
 
-            begin
-              require "numo/narray"
-              if count.zero?
-                Numo::SFloat.zeros(0)
-              else
-                Numo::SFloat.from_binary(Fiddle::Pointer.new(address)[0, bytes])
+                  bytes = count * Fiddle::SIZEOF_FLOAT
+                  if max_decoded_bytes && bytes > max_decoded_bytes
+                    raise TranscriptionRuntimeError,
+                          "Native FFmpeg exceeded the configured decoded-audio memory limit for #{path}"
+                  end
+
+                  begin
+                    require "numo/narray"
+                    if count.zero?
+                      Numo::SFloat.zeros(0)
+                    else
+                      Numo::SFloat.from_binary(Fiddle::Pointer.new(address)[0, bytes])
+                    end
+                  rescue LoadError => e
+                    raise TranscriptionRuntimeError, "numo-narray is required for decoded audio: #{e.message}"
+                  end
+                end
+              ensure
+                @functions.fetch(:free).call(address) unless address.zero?
               end
-            rescue LoadError => e
-              raise TranscriptionRuntimeError, "numo-narray is required for decoded audio: #{e.message}"
-            ensure
-              @functions.fetch(:free).call(address) unless address.zero?
             end
           end
 
@@ -193,6 +220,8 @@ module Cohere
           end
 
           private
+
+          private :decode_owned
 
           def c_string(value)
             Fiddle::Pointer["#{value}\0"]

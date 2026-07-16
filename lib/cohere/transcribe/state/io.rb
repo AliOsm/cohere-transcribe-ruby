@@ -63,7 +63,10 @@ module Cohere
       # is performed with the POSIX *at family against that descriptor.
       class BoundDirectory
         AT_FUNCTION_SIGNATURES = {
-          openat: [[Fiddle::TYPE_INT, Fiddle::TYPE_VOIDP, Fiddle::TYPE_INT, Fiddle::TYPE_INT], Fiddle::TYPE_INT],
+          openat: [
+            [Fiddle::TYPE_INT, Fiddle::TYPE_VOIDP, Fiddle::TYPE_INT, Fiddle::TYPE_VARIADIC],
+            Fiddle::TYPE_INT
+          ],
           renameat: [
             [Fiddle::TYPE_INT, Fiddle::TYPE_VOIDP, Fiddle::TYPE_INT, Fiddle::TYPE_VOIDP],
             Fiddle::TYPE_INT
@@ -294,7 +297,14 @@ module Cohere
 
         def open_entry(name, flags, permissions, mode:)
           validate_entry_name!(name)
-          file_descriptor = call_at!(:openat, descriptor, name, flags, permissions)
+          file_descriptor = call_at!(
+            :openat,
+            descriptor,
+            name,
+            flags,
+            Fiddle::TYPE_INT,
+            permissions
+          )
           handle = File.new(file_descriptor, mode, autoclose: true)
           file_descriptor = nil
           handle.close_on_exec = true

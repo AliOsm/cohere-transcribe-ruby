@@ -207,6 +207,8 @@ module Cohere
 
         valid = valid_repository_id?(text)
         invalid!("#{option} must be a valid Hugging Face repository ID or local directory") unless valid
+      rescue EncodingError
+        invalid!("#{option} must be a valid Hugging Face repository ID or local directory")
       rescue ArgumentError => e
         invalid!(e.message)
       end

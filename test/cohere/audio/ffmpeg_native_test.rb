@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "test_helper"
+require "fiddle"
 require "tmpdir"
 require "timeout"
 
@@ -153,6 +154,48 @@ module Cohere
             "RIFF", 36 + data_bytes, "WAVE", "fmt ", 16, 1, 1,
             SAMPLE_RATE, SAMPLE_RATE * 2, 2, 16, "data", data_bytes
           ].pack("a4Va4a4VvvVVvva4V")
+        end
+      end
+
+      class FFmpegNativeOwnershipTest < Minitest::Test
+        def test_interrupt_immediately_after_native_return_releases_the_pcm_buffer_once
+          bytes = 2 * Fiddle::SIZEOF_FLOAT
+          address = Fiddle.malloc(bytes)
+          Fiddle::Pointer.new(address)[0, bytes] = [0.25, -0.25].pack("f*")
+          freed = []
+          decode = lambda do |_path, _sample_rate, _maximum, output_slot, count_slot, _message, _capacity|
+            output_slot[0, Fiddle::SIZEOF_VOIDP] = [address].pack("J")
+            count_slot[0, Fiddle::SIZEOF_INT64_T] = [2].pack("q")
+            target = Thread.current
+            Thread.new { target.raise Interrupt }.join
+            0
+          end
+          library = fake_library(decode: decode, free: lambda { |pointer|
+            freed << pointer
+            Fiddle.free(pointer)
+          })
+
+          assert_raises(Interrupt) do
+            library.decode("fixture.wav", sample_rate: SAMPLE_RATE, max_decoded_bytes: bytes)
+          end
+          assert_equal [address], freed
+        ensure
+          Fiddle.free(address) if defined?(address) && address && defined?(freed) && freed.empty?
+        end
+
+        private
+
+        def fake_library(decode:, free:)
+          FFmpegNative::Library.allocate.tap do |library|
+            library.instance_variable_set(
+              :@functions,
+              {
+                decode: decode,
+                free: free,
+                cancel: -> {}
+              }
+            )
+          end
         end
       end
     end

@@ -249,12 +249,22 @@ module Cohere
             nil
           end
           memory_byte_limit = [(resolved_options.audio_memory_gb * (1024**3)).to_i, 1].max
+          estimate_bytes = if @decoder.respond_to?(:estimate_decoded_bytes)
+                             lambda do |item|
+                               @decoder.estimate_decoded_bytes(
+                                 item.entry.path,
+                                 backend: resolved_options.audio_backend,
+                                 sample_rate: SAMPLE_RATE
+                               )
+                             end
+                           end
           pipeline = Preparation::Pipeline.new(
             preparation_items,
             memory_byte_limit: memory_byte_limit,
             requested_workers: resolved_options.preprocess_workers,
             enabled: resolved_options.pipeline_preparation,
-            worker_limit: vad_file_concurrency_limit(resolved_options)
+            worker_limit: vad_file_concurrency_limit(resolved_options),
+            estimate_bytes: estimate_bytes
           ) do |item, decoded_byte_limit, worker_slot|
             prepare_entry(
               item,

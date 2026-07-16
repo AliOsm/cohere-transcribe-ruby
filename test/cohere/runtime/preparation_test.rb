@@ -113,6 +113,51 @@ class Cohere::Transcribe::RuntimePreparationTest < Minitest::Test
     assert_equal 0.0, pipeline.wait_seconds
   end
 
+  def test_estimated_sizes_give_a_large_file_enough_of_the_group_budget
+    limits = {}
+    pipeline = Pipeline.new(
+      { large: 40, small: 1 }.to_a,
+      memory_byte_limit: 100,
+      requested_workers: 2,
+      enabled: true,
+      estimate_bytes: ->(item) { item.fetch(1) }
+    ) do |item, limit, _slot|
+      name, bytes = item
+      limits[name] = limit
+      raise "artificial per-file ceiling" if limit < bytes
+
+      name
+    end
+
+    assert_equal %i[large small], pipeline.to_a
+    assert_operator limits.fetch(:large), :>=, 40
+    assert_operator limits.fetch(:small), :>=, 1
+  end
+
+  def test_file_larger_than_the_group_cap_uses_the_full_budget_without_overlap
+    started = []
+    pipeline = Pipeline.new(
+      %i[before large after],
+      memory_byte_limit: 100,
+      requested_workers: 3,
+      enabled: true,
+      estimate_bytes: ->(item) { item == :large ? 60 : 10 }
+    ) do |item, limit, _slot|
+      started << item
+      assert_equal(item == :large ? 100 : 50, limit)
+      item
+    end
+
+    yielded = []
+    pipeline.each do |item|
+      yielded << item
+      refute_includes started, :large if item == :before
+      refute_includes started, :after if item == :large
+    end
+
+    assert_equal %i[before large after], yielded
+  end
+
   def test_pipeline_reports_time_blocked_waiting_for_preparation
     pipeline = Pipeline.new(
       %i[first second],

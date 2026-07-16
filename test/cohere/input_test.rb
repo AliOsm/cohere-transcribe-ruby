@@ -34,6 +34,16 @@ module Cohere
         assert normalized.first.frozen?
       end
 
+      def test_binary_encoded_unix_paths_are_preserved_and_fail_through_typed_errors
+        path = "/tmp/caf\xE9.wav".b
+        normalized = Input.normalize(path)
+
+        assert_equal [path], normalized
+        assert_equal Encoding::ASCII_8BIT, normalized.first.encoding
+        error = assert_raises(TranscriptionInputError) { Input.expand(path) }
+        assert_match(/does not exist/, error.message)
+      end
+
       def test_normalize_rejects_ambiguous_and_invalid_values
         ["", "   ", [], Set["audio.wav"], { audio: "audio.wav" }, 42, :audio, Object.new].each do |audio|
           assert_raises(TranscriptionInputError, audio.inspect) { Input.normalize(audio) }

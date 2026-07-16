@@ -14,6 +14,7 @@ module Cohere
     # clients are reused without copying multi-gigabyte model weights.
     class Hub
       class Error < StandardError; end
+      class ConnectionError < Error; end
       class AuthenticationError < Error; end
       class NotFoundError < Error; end
 
@@ -22,12 +23,17 @@ module Cohere
 
       attr_reader :cache_dir, :endpoint
 
-      def initialize(cache_dir: nil, endpoint: nil, token: nil)
+      def initialize(cache_dir: nil, endpoint: nil, token: nil, offline: nil)
         hf_home = ENV.fetch("HF_HOME", File.expand_path("~/.cache/huggingface"))
         @cache_dir = Pathname(cache_dir || ENV.fetch("HF_HUB_CACHE", File.join(hf_home, "hub"))).expand_path
         @endpoint = (endpoint || ENV.fetch("HF_ENDPOINT", DEFAULT_ENDPOINT)).sub(%r{/+\z}, "")
         @endpoint_uri = URI(@endpoint)
         @token = token || ENV["HF_TOKEN"] || cached_token(hf_home)
+        @offline = offline.nil? ? truthy_environment?(ENV.fetch("HF_HUB_OFFLINE", nil)) : !!offline
+      end
+
+      def offline?
+        @offline
       end
 
       def resolve_revision(repo_id, revision = nil, filename: "config.json")
@@ -36,13 +42,23 @@ module Cohere
         validate_revision!(requested)
         return requested.downcase if COMMIT_PATTERN.match?(requested)
 
-        if (cached = cached_revision(repo_id, requested, filename: filename))
-          return cached
+        cached = cached_revision(repo_id, requested, filename: filename)
+        if offline?
+          return cached if cached
+
+          raise Error,
+                "Hub offline mode has no cached #{filename} snapshot for #{repo_id.inspect} at #{requested.inspect}"
         end
 
         encoded_repo = repo_id.split("/").map { |part| URI.encode_www_form_component(part) }.join("/")
         encoded_revision = URI.encode_www_form_component(requested)
-        response = request(URI("#{endpoint}/api/models/#{encoded_repo}/revision/#{encoded_revision}"))
+        begin
+          response = request(URI("#{endpoint}/api/models/#{encoded_repo}/revision/#{encoded_revision}"))
+        rescue ConnectionError
+          raise unless cached
+
+          return cached
+        end
         payload = JSON.parse(response.body)
         commit = payload["sha"]
         unless commit.is_a?(String) && COMMIT_PATTERN.match?(commit)
@@ -132,6 +148,7 @@ module Cohere
       private
 
       def request(uri, stream: nil, redirects: 0)
+        raise Error, "Hub offline mode prevents a request to #{uri}" if offline?
         raise Error, "Too many redirects while fetching #{uri}" if redirects > 8
 
         request = Net::HTTP::Get.new(uri)
@@ -185,7 +202,7 @@ module Cohere
         raise_http_error!(response, uri)
       rescue Timeout::Error, SocketError, SystemCallError, EOFError,
              Net::HTTPBadResponse, Net::HTTPHeaderSyntaxError, OpenSSL::SSL::SSLError => e
-        raise Error, "Cannot reach Hugging Face Hub at #{uri}: #{e.class}: #{e.message}"
+        raise ConnectionError, "Cannot reach Hugging Face Hub at #{uri}: #{e.class}: #{e.message}"
       end
 
       def response_content_length(response, uri)
@@ -380,6 +397,10 @@ module Cohere
         File.file?(token_path) ? File.read(token_path).strip : nil
       rescue Errno::EACCES
         nil
+      end
+
+      def truthy_environment?(value)
+        %w[1 ON YES TRUE].include?(value.to_s.upcase)
       end
 
       def cache_repo_name(repo_id)

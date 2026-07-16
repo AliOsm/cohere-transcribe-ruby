@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "tempfile"
+require "weakref"
 require "test_helper"
 require "cohere/transcribe/types"
 require "cohere/transcribe/errors"
@@ -8,7 +9,7 @@ require "cohere/transcribe/asr/native"
 
 class Cohere::Transcribe::NativeSessionTest < Minitest::Test
   class FakeLibrary
-    attr_reader :closed, :language, :opened, :sample_count, :setters
+    attr_reader :close_count, :closed, :language, :opened, :sample_count, :setters
 
     def initialize(
       batch_capacity: 24,
@@ -21,6 +22,7 @@ class Cohere::Transcribe::NativeSessionTest < Minitest::Test
       @buffers = []
       @setters = {}
       @closed = false
+      @close_count = 0
       @batch_capacity = batch_capacity
       @batch_failure_kind = batch_failure_kind
       @single_failure_kind = single_failure_kind
@@ -98,6 +100,7 @@ class Cohere::Transcribe::NativeSessionTest < Minitest::Test
       when :session_result_free
         @result_freed = true
       when :session_close
+        @close_count += 1
         @closed = true
       else
         raise "unexpected fake call: #{name}"
@@ -205,6 +208,14 @@ class Cohere::Transcribe::NativeSessionTest < Minitest::Test
     end
   end
 
+  class InterruptingInitializationLibrary < FakeLibrary
+    def call(name, *arguments)
+      raise Interrupt, "constructor interrupted after native open" if name == :session_set_beam_size
+
+      super
+    end
+  end
+
   def test_candidate_paths_never_search_a_neighboring_development_checkout
     original = ENV.delete("COHERE_TRANSCRIBE_NATIVE_LIBRARY")
 
@@ -277,6 +288,55 @@ class Cohere::Transcribe::NativeSessionTest < Minitest::Test
     end
   end
 
+  def test_gc_closes_an_abandoned_native_session_exactly_once
+    with_model_file do |path|
+      library = FakeLibrary.new
+      reference = abandon_native_session(path, library)
+
+      collect_until { !reference.weakref_alive? && library.close_count == 1 }
+      3.times { GC.start(full_mark: true, immediate_sweep: true) }
+
+      assert_equal 1, library.close_count
+    end
+  end
+
+  def test_explicit_close_then_gc_does_not_close_the_native_session_twice
+    with_model_file do |path|
+      library = FakeLibrary.new
+      session = Cohere::Transcribe::ASR::NativeSession.new(
+        path,
+        Cohere::Transcribe::TranscriptionOptions.new(device: "cpu"),
+        library: library
+      )
+      reference = WeakRef.new(session)
+
+      session.close
+      session = nil # rubocop:disable Lint/UselessAssignment -- release the final strong reference before GC
+      collect_until { !reference.weakref_alive? }
+
+      assert_equal 1, library.close_count
+    end
+  end
+
+  def test_constructor_interrupt_after_native_open_closes_exactly_once
+    with_model_file do |path|
+      library = InterruptingInitializationLibrary.new
+
+      error = assert_raises(Interrupt) do
+        Cohere::Transcribe::ASR::NativeSession.new(
+          path,
+          Cohere::Transcribe::TranscriptionOptions.new(device: "cpu"),
+          library: library
+        )
+      end
+
+      assert_equal "constructor interrupted after native open", error.message
+      assert_equal 1, library.close_count
+      3.times { GC.start(full_mark: true, immediate_sweep: true) }
+      assert_equal 1, library.close_count
+    end
+  end
+
   def test_native_text_materialization_uses_python_unicode_whitespace
     with_model_file do |path|
       library = FakeLibrary.new(
@@ -339,6 +399,7 @@ class Cohere::Transcribe::NativeSessionTest < Minitest::Test
 
       assert_match(/selected "CPU" \(cpu\).*"cuda" was resolved/, error.message)
       assert library.closed
+      assert_equal 1, library.close_count
     end
   end
 
@@ -576,6 +637,27 @@ class Cohere::Transcribe::NativeSessionTest < Minitest::Test
   end
 
   private
+
+  def abandon_native_session(path, library)
+    WeakRef.new(
+      Cohere::Transcribe::ASR::NativeSession.new(
+        path,
+        Cohere::Transcribe::TranscriptionOptions.new(device: "cpu"),
+        library: library
+      )
+    )
+  end
+
+  def collect_until(timeout: 2)
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
+    loop do
+      GC.start(full_mark: true, immediate_sweep: true)
+      return if yield
+      raise "object was not finalized before the test deadline" if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+
+      Thread.pass
+    end
+  end
 
   def with_model_file
     Tempfile.create(["dense-model", ".gguf"]) do |file|

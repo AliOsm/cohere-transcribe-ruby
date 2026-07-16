@@ -38,6 +38,75 @@ class PyTorchCheckpointTest < Minitest::Test
     end
   end
 
+  def test_zip_storage_crc_covers_the_complete_payload_before_contiguous_conversion
+    Dir.mktmpdir do |directory|
+      path = File.join(directory, "pytorch_model.bin")
+      tensors = {
+        "slice" => tensor(dtype: "F32", key: "0", shape: [1], stride: [1], elements: 4)
+      }
+      write_zip_checkpoint(path, tensors, "0" => [1.0, 2.0, 3.0, 4.0].pack("e*"))
+      reader = Checkpoint::Reader.new(path)
+      flip_byte(path, reader.fetch("slice").storage_data_start + 12)
+      output = StringIO.new(+"".b)
+
+      error = assert_raises(Checkpoint::Error) do
+        reader.write_tensor(reader.fetch("slice"), output, target_dtype: "F32")
+      end
+
+      assert_match(/storage "0" failed its CRC check/, error.message)
+      assert_empty output.string
+    end
+  end
+
+  def test_zip_storage_crc_covers_unused_bytes_for_a_strided_tensor
+    Dir.mktmpdir do |directory|
+      path = File.join(directory, "pytorch_model.bin")
+      tensors = {
+        "matrix" => tensor(dtype: "F32", key: "0", shape: [2, 2], stride: [1, 3], elements: 6)
+      }
+      write_zip_checkpoint(path, tensors, "0" => (0..5).map(&:to_f).pack("e*"))
+      reader = Checkpoint::Reader.new(path)
+      flip_byte(path, reader.fetch("matrix").storage_data_start + 20)
+      output = StringIO.new(+"".b)
+
+      error = assert_raises(Checkpoint::Error) do
+        reader.write_tensor(reader.fetch("matrix"), output, target_dtype: "F32")
+      end
+
+      assert_match(/storage "0" failed its CRC check/, error.message)
+      assert_empty output.string
+    end
+  end
+
+  def test_shared_zip_storage_is_fully_checked_only_once_for_contiguous_and_strided_tensors
+    Dir.mktmpdir do |directory|
+      path = File.join(directory, "pytorch_model.bin")
+      tensors = {
+        "matrix" => tensor(dtype: "F32", key: "0", shape: [3, 2], stride: [1, 3], elements: 6),
+        "flat" => tensor(dtype: "F32", key: "0", shape: [6], stride: [1], elements: 6)
+      }
+      write_zip_checkpoint(path, tensors, "0" => (0..5).map(&:to_f).pack("e*"))
+      reader = Checkpoint::Reader.new(path)
+      checked = []
+      probe = Module.new do
+        define_method(:verify_storage_crc!) do |storage_key, payload|
+          checked << storage_key
+          super(storage_key, payload)
+        end
+      end
+      reader.singleton_class.prepend(probe)
+
+      matrix = StringIO.new(+"".b)
+      flat = StringIO.new(+"".b)
+      reader.write_tensor(reader.fetch("matrix"), matrix, target_dtype: "F32", chunk_bytes: 5)
+      reader.write_tensor(reader.fetch("flat"), flat, target_dtype: "F32", chunk_bytes: 5)
+
+      assert_equal ["0"], checked
+      assert_equal [0.0, 3.0, 1.0, 4.0, 2.0, 5.0], matrix.string.unpack("e*")
+      assert_equal (0..5).map(&:to_f), flat.string.unpack("e*")
+    end
+  end
+
   def test_reads_legacy_pickle_and_raw_storage_stream_without_executing_python
     Dir.mktmpdir do |directory|
       path = File.join(directory, "pytorch_model.bin")
@@ -126,6 +195,49 @@ class PyTorchCheckpointTest < Minitest::Test
 
       assert_equal ["archive/data.pkl"], archive.entries.keys
       assert_equal proto + "}.", archive.read("archive/data.pkl")
+    end
+  end
+
+  def test_classic_zip_accepts_exact_16_bit_values_in_32_bit_entry_fields
+    Dir.mktmpdir do |directory|
+      size_path = File.join(directory, "exact-size.zip")
+      payload = "x" * 0xffff
+      write_zip(size_path, "archive/data.pkl" => payload)
+
+      assert_equal payload, Checkpoint::ZipArchive.new(size_path).read("archive/data.pkl")
+
+      offset_path = File.join(directory, "exact-offset.zip")
+      write_zip_at_offset(offset_path, "archive/data.pkl", proto + "}.", local_offset: 0xffff)
+
+      assert_equal proto + "}.", Checkpoint::ZipArchive.new(offset_path).read("archive/data.pkl")
+    end
+  end
+
+  def test_classic_zip_accepts_exact_maximum_entry_count_without_a_zip64_locator
+    Dir.mktmpdir do |directory|
+      path = File.join(directory, "exact-entry-count.zip")
+      write_empty_classic_zip(path, 0xffff)
+
+      archive = Checkpoint::ZipArchive.new(path)
+
+      assert_equal 0xffff, archive.entries.length
+      assert archive.entries.key?("entry-00000")
+      assert archive.entries.key?("entry-65534")
+    end
+  end
+
+  def test_locator_present_zip64_still_rejects_a_malformed_end_record
+    Dir.mktmpdir do |directory|
+      path = File.join(directory, "malformed-zip64.bin")
+      write_zip64(path, "archive/data.pkl", proto + "}.")
+      bytes = File.binread(path)
+      locator = bytes.index([Checkpoint::ZIP64_LOCATOR].pack("V"))
+      bytes[locator + 8, 8] = [1].pack("Q<")
+      File.binwrite(path, bytes)
+
+      error = assert_raises(Checkpoint::Error) { Checkpoint::ZipArchive.new(path) }
+
+      assert_match(/invalid ZIP64 end record/, error.message)
     end
   end
 
@@ -317,6 +429,57 @@ class PyTorchCheckpointTest < Minitest::Test
       central.bytesize, local.bytesize, 0
     ].pack("VvvvvVVv")
     File.binwrite(path, local + central + eocd)
+  end
+
+  def write_zip_at_offset(path, name, payload, local_offset:)
+    name = name.b
+    payload = payload.b
+    crc = Zlib.crc32(payload)
+    local = ("\0".b * local_offset) + [
+      Checkpoint::ZIP_LOCAL, 20, 0x800, 0, 0, 0, crc,
+      payload.bytesize, payload.bytesize, name.bytesize, 0
+    ].pack("VvvvvvVVVvv") + name + payload
+    central = [
+      Checkpoint::ZIP_CENTRAL, 20, 20, 0x800, 0, 0, 0, crc,
+      payload.bytesize, payload.bytesize, name.bytesize, 0, 0, 0, 0, 0, local_offset
+    ].pack("VvvvvvvVVVvvvvvVV") + name
+    eocd = [
+      Checkpoint::ZIP_EOCD, 0, 0, 1, 1, central.bytesize, local.bytesize, 0
+    ].pack("VvvvvVVv")
+    File.binwrite(path, local + central + eocd)
+  end
+
+  def write_empty_classic_zip(path, count)
+    local = +"".b
+    central = +"".b
+    count.times do |index|
+      name = format("entry-%05d", index).b
+      local_offset = local.bytesize
+      local << [
+        Checkpoint::ZIP_LOCAL, 20, 0x800, 0, 0, 0, 0,
+        0, 0, name.bytesize, 0
+      ].pack("VvvvvvVVVvv") << name
+      central << [
+        Checkpoint::ZIP_CENTRAL, 20, 20, 0x800, 0, 0, 0, 0,
+        0, 0, name.bytesize, 0, 0, 0, 0, 0, local_offset
+      ].pack("VvvvvvvVVVvvvvvVV") << name
+    end
+    eocd = [
+      Checkpoint::ZIP_EOCD, 0, 0, count, count,
+      central.bytesize, local.bytesize, 0
+    ].pack("VvvvvVVv")
+    File.binwrite(path, local + central + eocd)
+  end
+
+  def flip_byte(path, offset)
+    File.open(path, "r+b") do |file|
+      file.seek(offset)
+      byte = file.read(1)
+      raise "fixture byte is missing" unless byte
+
+      file.seek(offset)
+      file.write([byte.unpack1("C") ^ 0xff].pack("C"))
+    end
   end
 
   def write_deflated_zip(path, name, payload, declared_size:)

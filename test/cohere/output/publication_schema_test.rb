@@ -722,6 +722,101 @@ module Cohere
           end
         end
 
+        def test_skip_revalidation_reprocesses_an_output_replaced_during_verification
+          original_same_regular_entry = State::BoundDirectory.instance_method(:same_regular_entry?)
+          replaced = false
+
+          Dir.mktmpdir("cohere-skip-output-race") do |directory|
+            root = Pathname(directory)
+            plan, skip_options = published_skip_fixture(root)
+            output = plan.paths.fetch("txt")
+            parked = output.dirname.join("original-clip.txt")
+            State::BoundDirectory.define_method(:same_regular_entry?) do |name, expected_stat|
+              if name == output.basename.to_s && !replaced
+                replaced = true
+                output.rename(parked)
+                output.binwrite("replacement transcript\n")
+              end
+              original_same_regular_entry.bind_call(self, name, expected_stat)
+            end
+
+            decision = Publication.with_plan_lock(plan) do
+              Publication.revalidate(plan, skip_options)
+            end
+
+            assert replaced
+            assert_equal :process, decision.action
+            assert_match(/txt output changed or is not regular/, decision.reason)
+          end
+        ensure
+          State::BoundDirectory.define_method(:same_regular_entry?, original_same_regular_entry) if original_same_regular_entry
+        end
+
+        def test_skip_revalidation_reprocesses_a_nonregular_output_replacement
+          original_same_regular_entry = State::BoundDirectory.instance_method(:same_regular_entry?)
+          replaced = false
+
+          Dir.mktmpdir("cohere-skip-output-nonregular") do |directory|
+            root = Pathname(directory)
+            plan, skip_options = published_skip_fixture(root)
+            output = plan.paths.fetch("txt")
+            parked = output.dirname.join("original-clip.txt")
+            State::BoundDirectory.define_method(:same_regular_entry?) do |name, expected_stat|
+              if name == output.basename.to_s && !replaced
+                replaced = true
+                output.rename(parked)
+                output.mkdir
+              end
+              original_same_regular_entry.bind_call(self, name, expected_stat)
+            end
+
+            decision = Publication.with_plan_lock(plan) do
+              Publication.revalidate(plan, skip_options)
+            end
+
+            assert replaced
+            assert_equal :process, decision.action
+            assert_match(/txt output changed or is not regular/, decision.reason)
+          end
+        ensure
+          State::BoundDirectory.define_method(:same_regular_entry?, original_same_regular_entry) if original_same_regular_entry
+        end
+
+        def test_skip_verification_still_propagates_a_changed_directory_guard
+          original_same_regular_entry = State::BoundDirectory.instance_method(:same_regular_entry?)
+          changed = false
+
+          Dir.mktmpdir("cohere-skip-output-guard") do |directory|
+            root = Pathname(directory)
+            plan, skip_options = published_skip_fixture(
+              root,
+              relative_path: Pathname("nested/clip.wav")
+            )
+            output = plan.paths.fetch("txt")
+            output_root = root.join("out")
+            parked = root.join("parked-output")
+            State::BoundDirectory.define_method(:same_regular_entry?) do |name, expected_stat|
+              if name == output.basename.to_s && !changed
+                changed = true
+                output_root.rename(parked)
+                output_root.mkdir
+              end
+              original_same_regular_entry.bind_call(self, name, expected_stat)
+            end
+
+            error = assert_raises(TranscriptionRuntimeError) do
+              Publication.with_plan_lock(plan) do
+                Publication.revalidate(plan, skip_options)
+              end
+            end
+
+            assert changed
+            assert_match(/Publication parent changed/, error.message)
+          end
+        ensure
+          State::BoundDirectory.define_method(:same_regular_entry?, original_same_regular_entry) if original_same_regular_entry
+        end
+
         def test_publication_rechecks_the_planned_source_immediately_before_commit
           Dir.mktmpdir do |directory|
             root = Pathname(directory)
@@ -963,6 +1058,25 @@ module Cohere
         end
 
         private
+
+        def published_skip_fixture(root, relative_path: Pathname("clip.wav"))
+          source = root.join("source", relative_path)
+          source.dirname.mkpath
+          source.binwrite("audio")
+          entry = InputEntry.new(path: source.realpath, relative_path: relative_path)
+          overwrite = options_with_publication.with(
+            publication: PublicationOptions.new(
+              formats: %w[txt json], output_dir: root.join("out"), existing: "overwrite"
+            )
+          )
+          plan = Publication.plan([entry], overwrite).fetch(source.realpath)
+          completed = result.with(path: source.realpath, relative_path: relative_path)
+          Publication.write(plan, completed, overwrite)
+          skip_options = overwrite.with(
+            publication: overwrite.publication.with(existing: "skip")
+          )
+          [plan, skip_options]
+        end
 
         def options_with_publication(profile_json: nil)
           TranscriptionOptions.new(

@@ -2,7 +2,9 @@
 
 require "fileutils"
 require "rbconfig"
+require "rubygems/version"
 require "shellwords"
+require "open3"
 
 EXTENSION_DIR = File.expand_path(__dir__)
 GEM_ROOT = File.expand_path("../..", EXTENSION_DIR)
@@ -22,8 +24,16 @@ abort "COHERE_TRANSCRIBE_CUDA=1 is only supported on Linux" if cuda && !host_os.
 abort "enable either CUDA or Metal, not both" if cuda && metal
 
 cmake = ENV.fetch("CMAKE", "cmake")
-unless system(cmake, "--version", out: File::NULL, err: File::NULL)
-  abort "cmake 3.14 or newer is required to build cohere-transcribe's native runtime"
+begin
+  cmake_output, cmake_status = Open3.capture2e(cmake, "--version")
+rescue SystemCallError
+  cmake_output = nil
+  cmake_status = nil
+end
+cmake_version_match = cmake_output&.match(/cmake version (\d+(?:\.\d+)+)/i)
+cmake_version = cmake_version_match && cmake_version_match[1]
+unless cmake_status&.success? && cmake_version && Gem::Version.new(cmake_version) >= Gem::Version.new("3.15")
+  abort "cmake 3.15 or newer is required to build cohere-transcribe's native runtime"
 end
 
 build_dir = File.expand_path(

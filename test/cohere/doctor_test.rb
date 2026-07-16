@@ -180,6 +180,34 @@ class Cohere::Transcribe::DoctorTest < Minitest::Test
     refute_includes out.string, "cross-attention"
   end
 
+  def test_runtime_and_word_checks_report_load_errors_in_the_results
+    require "cohere/transcribe/asr/native"
+    runtime_out = StringIO.new
+    runtime_results = Doctor::Results.new(out: runtime_out)
+    replace_singleton_methods(
+      Cohere::Transcribe::ASR::NativeLibrary,
+      load: -> { raise LoadError, "missing native fixture" }
+    ) do
+      Doctor.validate_common_runtime(runtime_results)
+    end
+
+    assert_equal 1, runtime_results.failures
+    assert_includes runtime_out.string, "LoadError: missing native fixture"
+
+    require "cohere/transcribe/alignment/ctc"
+    word_out = StringIO.new
+    word_results = Doctor::Results.new(out: word_out)
+    replace_singleton_methods(
+      Cohere::Transcribe::Alignment::CTC,
+      forced_align: ->(*) { raise LoadError, "missing alignment fixture" }
+    ) do
+      Doctor.validate_word_alignment(word_results)
+    end
+
+    assert_equal 1, word_results.failures
+    assert_includes word_out.string, "LoadError: missing alignment fixture"
+  end
+
   def test_model_access_validates_dense_weights_and_tokenizer_metadata
     Dir.mktmpdir do |directory|
       model = Pathname(directory)

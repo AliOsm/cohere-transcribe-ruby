@@ -374,6 +374,29 @@ module Cohere
         assert_raises(Errno::EIO) { State::BoundDirectory.new(nil, handle, []).fsync }
       end
 
+      def test_bound_directory_create_temporary_passes_the_mode_at_creation
+        arguments, = State::BoundDirectory::AT_FUNCTION_SIGNATURES.fetch(:openat)
+        assert_equal Fiddle::TYPE_VARIADIC, arguments.last
+
+        Dir.mktmpdir("cohere-bound-openat") do |directory|
+          bound = State::BoundDirectory.open(
+            State::DirectoryBinding.capture(Pathname(directory))
+          )
+          previous_umask = File.umask(0)
+          temporary_name = nil
+          handle = nil
+          begin
+            temporary_name, handle = bound.create_temporary("entry", ".tmp")
+            assert_equal 0o600, handle.stat.mode & 0o777
+          ensure
+            File.umask(previous_umask)
+            handle&.close
+            bound.unlink(temporary_name, missing_ok: true) if temporary_name
+            bound.close
+          end
+        end
+      end
+
       def test_atomic_state_write_reports_cleanup_failure_after_success
         Dir.mktmpdir("cohere-state-cleanup-success") do |directory|
           root = Pathname(directory)

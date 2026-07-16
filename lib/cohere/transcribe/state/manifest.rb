@@ -105,18 +105,21 @@ module Cohere
           return "state marker path for #{format} does not match" unless record.is_a?(Hash) && record["name"] == path.basename.to_s
 
           begin
-            size, sha256 = if directory_binding
-                             bound_output_record(
-                               path,
-                               directory_binding: directory_binding,
-                               guard_bindings: guard_bindings
-                             )
-                           else
-                             stat = path.lstat
-                             return "#{format} output is missing or not regular" unless stat.file? && !stat.symlink?
+            output_record = if directory_binding
+                              bound_output_record(
+                                path,
+                                directory_binding: directory_binding,
+                                guard_bindings: guard_bindings
+                              )
+                            else
+                              stat = path.lstat
+                              return "#{format} output is missing or not regular" unless stat.file? && !stat.symlink?
 
-                             [stat.size, Digest::SHA256.file(path).hexdigest]
-                           end
+                              [stat.size, Digest::SHA256.file(path).hexdigest]
+                            end
+            return "#{format} output changed or is not regular" unless output_record
+
+            size, sha256 = output_record
             return "#{format} output does not match its state marker" if record["size"] != size || record["sha256"] != sha256
           rescue Errno::ENOENT
             return "#{format} output is missing or not regular"
@@ -133,14 +136,25 @@ module Cohere
         ) do |bound, basename|
           bound.verify!
           handle = nil
-          Thread.handle_interrupt(DEFERRED_PUBLICATION_EXCEPTIONS) do
-            handle = bound.open_regular(basename)
+          begin
+            Thread.handle_interrupt(DEFERRED_PUBLICATION_EXCEPTIONS) do
+              handle = bound.open_regular(basename)
+            end
+          rescue TranscriptionRuntimeError
+            bound.verify!
+            return nil
           end
           opened = handle.stat
           digest = Digest::SHA256.new
           digest << handle.read(1024 * 1024) until handle.eof?
-          unless bound.same_regular_entry?(basename, opened)
-            raise TranscriptionRuntimeError, "Output changed while it was being verified: #{path}"
+          unchanged = begin
+            bound.same_regular_entry?(basename, opened)
+          rescue TranscriptionRuntimeError
+            false
+          end
+          unless unchanged
+            bound.verify!
+            return nil
           end
 
           bound.verify!

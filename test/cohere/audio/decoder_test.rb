@@ -16,8 +16,7 @@ module Cohere
             assert_nil decoded.fallback_reason
             assert_equal 400, decoded.samples.length
             assert decoded.samples.frozen?
-            expected = decoded.backend == "ffmpeg" ? Math.sqrt(0.5) * 0.25 : 0.125
-            assert_in_delta expected, decoded.samples[200], 1e-6
+            assert_in_delta Math.sqrt(0.5) * 0.25, decoded.samples[200], 1e-6
           end
         end
 
@@ -34,6 +33,53 @@ module Cohere
             File.binwrite(corrupt, "not audio")
             assert_nil Decoder.probe_duration(corrupt)
           end
+        end
+
+        def test_decode_size_estimate_covers_the_libsndfile_stereo_input_buffer
+          with_wav(sample_rate: SAMPLE_RATE, channels: 2, frames: 400) do |path|
+            replace_singleton_methods(FFmpegNative, available?: -> { false }) do
+              estimate = Decoder.estimate_decoded_bytes(
+                path,
+                backend: "librosa",
+                sample_rate: SAMPLE_RATE
+              )
+
+              assert_equal 400 * 2 * Fiddle::SIZEOF_FLOAT, estimate
+            end
+          end
+        end
+
+        def test_libsndfile_metadata_allocations_register_release_callbacks
+          sound_file = Audio.const_get(:SoundFileABI, false)
+          sample_rate = Audio.const_get(:SampleRateABI, false)
+          skip "libsndfile or libsamplerate is unavailable" unless sound_file.const_get(:AVAILABLE) && sample_rate.const_get(:AVAILABLE)
+
+          sound_file_releases = []
+          sample_rate_releases = []
+          original_sound_file_malloc = sound_file::SFInfo.method(:malloc)
+          original_sample_rate_malloc = sample_rate::SRCData.method(:malloc)
+          sound_file_malloc = lambda do |release = nil, &block|
+            sound_file_releases << release
+            original_sound_file_malloc.call(release, &block)
+          end
+          sample_rate_malloc = lambda do |release = nil, &block|
+            sample_rate_releases << release
+            original_sample_rate_malloc.call(release, &block)
+          end
+
+          replace_singleton_methods(sound_file::SFInfo, malloc: sound_file_malloc) do
+            replace_singleton_methods(sample_rate::SRCData, malloc: sample_rate_malloc) do
+              replace_singleton_methods(FFmpegNative, available?: -> { false }) do
+                with_wav(sample_rate: 8_000, channels: 2, frames: 400) do |path|
+                  Decoder.probe_duration(path)
+                  Decoder.decode(path, backend: "librosa", sample_rate: SAMPLE_RATE)
+                end
+              end
+            end
+          end
+
+          assert_equal [Fiddle::RUBY_FREE, Fiddle::RUBY_FREE], sound_file_releases
+          assert_equal [Fiddle::RUBY_FREE], sample_rate_releases
         end
 
         def test_darwin_library_candidates_include_homebrew_and_macports
@@ -55,8 +101,7 @@ module Cohere
 
             assert_equal SAMPLE_RATE, decoded.sample_rate
             assert_in_delta 1_600, decoded.samples.length, 1
-            expected = decoded.backend == "ffmpeg" ? Math.sqrt(0.5) * 0.25 : 0.125
-            assert_in_delta expected, decoded.samples[decoded.samples.length / 2], 0.005
+            assert_in_delta Math.sqrt(0.5) * 0.25, decoded.samples[decoded.samples.length / 2], 0.005
           end
         end
 
@@ -76,6 +121,17 @@ module Cohere
 
               assert_equal "libsndfile", decoded.backend
               assert_match(/librosa compatibility mode/, decoded.fallback_reason)
+            end
+          end
+        end
+
+        def test_libsndfile_stereo_downmix_matches_native_ffmpeg_energy
+          with_wav(sample_rate: SAMPLE_RATE, channels: 2, frames: 400) do |path|
+            replace_singleton_methods(FFmpegNative, available?: -> { false }) do
+              decoded = Decoder.decode(path, backend: "librosa")
+
+              assert_equal "libsndfile", decoded.backend
+              assert_in_delta Math.sqrt(0.5) * 0.25, decoded.samples[200], 1e-6
             end
           end
         end

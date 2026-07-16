@@ -282,7 +282,7 @@ module Cohere
         library = native_library || ASR::NativeLibrary.load
         results.ok("native Cohere ASR runtime: #{library.path}")
         report_native_device_capabilities(results, library)
-      rescue StandardError => e
+      rescue LoadError, StandardError => e
         results.fail("native Cohere ASR runtime: #{e.class}: #{e.message}")
       end
 
@@ -347,7 +347,7 @@ module Cohere
           "word aligner: #{Alignment::ModelProvider::REPOSITORY}@#{Alignment::ModelProvider::REVISION}, " \
           "FP32 SHA-256 #{fp32.sha256}, bounded per-segment uniform fallback"
         )
-      rescue StandardError => e
+      rescue LoadError, StandardError => e
         results.fail("word alignment: #{e.class}: #{e.message}")
       end
 

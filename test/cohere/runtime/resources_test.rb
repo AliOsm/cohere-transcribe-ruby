@@ -84,6 +84,29 @@ class Cohere::Transcribe::RuntimeResourcesTest < Minitest::Test
     first&.close
   end
 
+  def test_collected_owner_closes_its_session_before_a_replacement_loads
+    events = []
+    first_session = Session.new(events: events, label: :first)
+    reference = abandon_resources_with(first_session)
+
+    collect_until { !reference.weakref_alive? && first_session.close_count == 1 }
+    assert_nil Resources.current_asr_owner
+
+    replacement = Resources.new
+    second_session = Session.new(events: events, label: :second)
+    replacement.acquire_asr(%w[cuda bf16]) do
+      events << %i[loaded second]
+      second_session
+    end
+
+    assert_equal [%i[closed first], %i[loaded second]], events
+    assert_equal 1, first_session.close_count
+    3.times { GC.start(full_mark: true, immediate_sweep: true) }
+    assert_equal 1, first_session.close_count
+  ensure
+    replacement&.close
+  end
+
   def test_global_evict_supports_checkpoint_only_word_alignment
     events = []
     owner = Resources.new
@@ -169,5 +192,24 @@ class Cohere::Transcribe::RuntimeResourcesTest < Minitest::Test
     assert_nil Resources.current_asr_owner
     resources.close
     assert resources.closed?
+  end
+
+  private
+
+  def abandon_resources_with(session)
+    resources = Resources.new
+    resources.acquire_asr(%w[cpu fp32]) { session }
+    WeakRef.new(resources)
+  end
+
+  def collect_until(timeout: 2)
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
+    loop do
+      GC.start(full_mark: true, immediate_sweep: true)
+      return if yield
+      raise "resources were not finalized before the test deadline" if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+
+      Thread.pass
+    end
   end
 end

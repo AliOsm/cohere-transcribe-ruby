@@ -25,11 +25,14 @@ module Cohere
       ZIP_CENTRAL_LIMIT = 256 * 1024 * 1024
       ZIP_COMPRESSED_OVERHEAD = 1024 * 1024
       ZIP_INFLATE_CHUNK = 16 * 1024
+      STORAGE_CRC_CHUNK_BYTES = 4 * 1024 * 1024
       ZIP_EOCD = 0x0605_4b50
       ZIP64_EOCD = 0x0606_4b50
       ZIP64_LOCATOR = 0x0706_4b50
       ZIP_CENTRAL = 0x0201_4b50
       ZIP_LOCAL = 0x0403_4b50
+      ZIP64_UINT16_MARKER = 0xffff
+      ZIP64_UINT32_MARKER = 0xffff_ffff
 
       STORAGE_DTYPES = {
         "FloatStorage" => ["F32", 4],
@@ -41,6 +44,7 @@ module Cohere
 
       Global = Data.define(:module_name, :name)
       StorageRef = Data.define(:dtype, :key, :elements, :base_offset)
+      StoragePayload = Data.define(:data_offset, :size, :crc32)
       TensorSpec = Data.define(:storage, :storage_offset, :shape, :stride)
       Entry = Data.define(
         :name, :compression_method, :flags, :crc32, :compressed_size, :size,
@@ -176,10 +180,12 @@ module Cohere
             raise Error, "Multi-disk PyTorch ZIP archives are not supported"
           end
 
-          if [disk_entries, total_entries].include?(0xffff) ||
-             [central_size, central_offset].include?(0xffff_ffff)
-            total_entries, central_size, central_offset = zip64_directory(eocd_offset)
-          end
+          zip64_marker = disk_entries == ZIP64_UINT16_MARKER ||
+                         total_entries == ZIP64_UINT16_MARKER ||
+                         central_size == ZIP64_UINT32_MARKER ||
+                         central_offset == ZIP64_UINT32_MARKER
+          total_entries, central_size, central_offset = zip64_directory(eocd_offset) if
+            zip64_marker && zip64_locator_present?(eocd_offset)
           if total_entries > ZIP_ENTRY_LIMIT || central_size > ZIP_CENTRAL_LIMIT ||
              central_size > size || central_offset > size - central_size
             raise Error, "PyTorch archive #{path} has invalid central-directory bounds"
@@ -213,6 +219,12 @@ module Cohere
           end
 
           [total_entries, central_size, central_offset]
+        end
+
+        def zip64_locator_present?(eocd_offset)
+          return false if eocd_offset < 20
+
+          read_range(eocd_offset - 20, 4).unpack1("V") == ZIP64_LOCATOR
         end
 
         def parse_central_directory(bytes, expected_entries:, archive_size:, data_limit:)
@@ -301,9 +313,8 @@ module Cohere
             cursor += length
           end
 
-          required = [size, compressed_size, local_offset, disk].count do |value|
-            [0xffff_ffff, 0xffff].include?(value)
-          end
+          required = [size, compressed_size, local_offset].count(ZIP64_UINT32_MARKER)
+          required += 1 if disk == ZIP64_UINT16_MARKER
           return [size, compressed_size, local_offset, disk] if required.zero?
           raise Error, "PyTorch archive #{path} lacks required ZIP64 size data" unless values
 
@@ -322,10 +333,10 @@ module Cohere
             cursor += 4
             value
           end
-          size = take_qword.call if size == 0xffff_ffff
-          compressed_size = take_qword.call if compressed_size == 0xffff_ffff
-          local_offset = take_qword.call if local_offset == 0xffff_ffff
-          disk = take_dword.call if disk == 0xffff
+          size = take_qword.call if size == ZIP64_UINT32_MARKER
+          compressed_size = take_qword.call if compressed_size == ZIP64_UINT32_MARKER
+          local_offset = take_qword.call if local_offset == ZIP64_UINT32_MARKER
+          disk = take_dword.call if disk == ZIP64_UINT16_MARKER
           [size, compressed_size, local_offset, disk]
         end
 
@@ -771,6 +782,9 @@ module Cohere
         def initialize(path)
           @path = Pathname(path).expand_path
           @storages = {}
+          @storage_payloads = {}
+          @verified_storage_payloads = {}
+          @storage_verification_mutex = Mutex.new
           @tensors = read_checkpoint.freeze
         end
 
@@ -797,6 +811,8 @@ module Cohere
             raise Error, "Cannot convert #{tensor.name.inspect} from #{tensor.dtype} to #{target_dtype}"
           end
           raise ArgumentError, "chunk_bytes must be positive" unless chunk_bytes.positive?
+
+          verify_storage_payload!(tensor)
 
           source_width = Safetensors::DTYPE_BYTES.fetch(tensor.dtype)
           elements_per_chunk = [chunk_bytes / source_width, 1].max
@@ -873,6 +889,12 @@ module Cohere
             unless entry.size == expected
               raise Error, "PyTorch storage #{storage.key.inspect} has #{entry.size} bytes; expected #{expected}"
             end
+
+            @storage_payloads[storage.key] ||= StoragePayload.new(
+              data_offset: entry.data_offset,
+              size: entry.size,
+              crc32: entry.crc32
+            )
 
             entry.data_offset
           end
@@ -1011,6 +1033,41 @@ module Cohere
             expected *= dimension unless dimension.zero?
           end
           true
+        end
+
+        def verify_storage_payload!(tensor)
+          payload = @storage_payloads[tensor.storage_key]
+          return unless payload
+
+          @storage_verification_mutex.synchronize do
+            return if @verified_storage_payloads.key?(tensor.storage_key)
+
+            verify_storage_crc!(tensor.storage_key, payload)
+            @verified_storage_payloads[tensor.storage_key] = true
+          end
+        end
+
+        def verify_storage_crc!(storage_key, payload)
+          crc32 = 0
+          remaining = payload.size
+          File.open(path, "rb") do |source|
+            source.seek(payload.data_offset)
+            while remaining.positive?
+              requested = [remaining, STORAGE_CRC_CHUNK_BYTES].min
+              chunk = source.read(requested)
+              if chunk.nil? || chunk.bytesize != requested
+                raise Error, "Unexpected end of #{path} while checking storage #{storage_key.inspect}"
+              end
+
+              crc32 = Zlib.crc32(chunk, crc32)
+              remaining -= requested
+            end
+          end
+          return if crc32 == payload.crc32
+
+          raise Error, "PyTorch tensor storage #{storage_key.inspect} failed its CRC check"
+        rescue Errno::ENOENT, Errno::EACCES => e
+          raise Error, "Cannot read PyTorch checkpoint #{path}: #{e.message}"
         end
 
         # General strided tensors occur in legitimate torch state dictionaries

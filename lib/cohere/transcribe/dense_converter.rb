@@ -28,6 +28,7 @@ module Cohere
         ▁ <|startofcontext|> <|startoftranscript|> <|emo:undefined|>
         <|ar|> <|pnc|> <|noitn|> <|notimestamp|> <|nodiarize|> <|endoftext|>
       ].freeze
+      MAX_VOCABULARY_SIZE = (1 << 32) - 1
       OUTPUT_TYPES = %i[f16 f32 bf16].freeze
       REQUIRED_ARTIFACT_FILENAMES = %w[config.json tokenizer.json].freeze
       WEIGHT_ARTIFACT_FILENAMES = %w[
@@ -291,7 +292,9 @@ module Cohere
 
       def load_vocabulary
         embedding = fetch_source_tensor("transf_decoder._embedding.token_embedding.weight")
-        unless embedding.shape.length == 2 && embedding.shape[0].positive?
+        unless embedding.shape.length == 2 &&
+               embedding.shape.all? { |dimension| dimension.is_a?(Integer) && dimension.positive? } &&
+               embedding.shape[0] <= MAX_VOCABULARY_SIZE
           raise Error, "Tensor #{embedding.name.inspect} has an invalid vocabulary shape #{embedding.shape.inspect}"
         end
 
@@ -320,13 +323,35 @@ module Cohere
           )
         end
 
-        missing = (0...expected_size).reject { |id| tokens_by_id.key?(id) }
-        raise Error, "tokenizer.json vocabulary has missing token IDs: #{missing.first(8).inspect}" unless missing.empty?
+        ordered_ids = tokens_by_id.keys.sort
+        if ordered_ids.length != expected_size
+          missing = first_missing_vocabulary_ids(ordered_ids, expected_size, limit: 8)
+          raise Error, "tokenizer.json vocabulary has missing token IDs: #{missing.inspect}"
+        end
 
         missing_prompt = REQUIRED_PROMPT_TOKENS.reject { |token| ids_by_token.key?(token) }
         raise Error, "tokenizer.json is missing Cohere prompt tokens: #{missing_prompt.join(", ")}" unless missing_prompt.empty?
 
-        (0...expected_size).map { |id| tokens_by_id.fetch(id) }
+        ordered_ids.map { |id| tokens_by_id.fetch(id) }
+      end
+
+      def first_missing_vocabulary_ids(ordered_ids, expected_size, limit:)
+        missing = []
+        expected_id = 0
+        ordered_ids.each do |id|
+          while expected_id < id && missing.length < limit
+            missing << expected_id
+            expected_id += 1
+          end
+          break if missing.length == limit
+
+          expected_id = id + 1
+        end
+        while expected_id < expected_size && missing.length < limit
+          missing << expected_id
+          expected_id += 1
+        end
+        missing
       end
 
       def add_vocabulary_entry!(tokens_by_id, ids_by_token, token, id, expected_size:)
