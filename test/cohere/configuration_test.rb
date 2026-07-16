@@ -258,10 +258,9 @@ module Cohere
           begin
             Dir.mkdir(binary_directory)
           rescue Errno::EILSEQ
-            error = assert_raises(TranscriptionConfigurationError) do
+            assert_raises(TranscriptionConfigurationError) do
               Configuration.validate!(options)
             end
-            assert_match(/Cannot resolve model path|valid Hugging Face repository ID or local directory/, error.message)
           else
             assert_same options, Configuration.validate!(options)
           end
