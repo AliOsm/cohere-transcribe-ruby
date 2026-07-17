@@ -216,6 +216,15 @@ class Cohere::Transcribe::NativeSessionTest < Minitest::Test
     end
   end
 
+  class KillingInitializationLibrary < FakeLibrary
+    def open_session(**keywords)
+      session = super
+      caller = Thread.current
+      Thread.new { caller.kill }.join
+      session
+    end
+  end
+
   def test_candidate_paths_never_search_a_neighboring_development_checkout
     original = ENV.delete("COHERE_TRANSCRIBE_NATIVE_LIBRARY")
 
@@ -371,6 +380,29 @@ class Cohere::Transcribe::NativeSessionTest < Minitest::Test
       assert_equal 1, library.close_count
       3.times { GC.start(full_mark: true, immediate_sweep: true) }
       assert_equal 1, library.close_count
+    end
+  end
+
+  def test_constructor_kill_after_native_open_closes_exactly_once
+    with_model_file do |path|
+      library = KillingInitializationLibrary.new
+      caller = Thread.new do
+        Cohere::Transcribe::ASR::NativeSession.new(
+          path,
+          Cohere::Transcribe::TranscriptionOptions.new(device: "cpu"),
+          library: library
+        )
+      end
+      caller.report_on_exception = false
+
+      assert caller.join(2), "native constructor remained stuck after termination"
+      assert_nil caller.value
+      assert_equal 1, library.close_count
+      3.times { GC.start(full_mark: true, immediate_sweep: true) }
+      assert_equal 1, library.close_count
+    ensure
+      caller&.kill
+      caller&.join
     end
   end
 

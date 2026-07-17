@@ -2,12 +2,17 @@
 
 require "test_helper"
 require "json"
+require "net/http"
 require "socket"
 require "timeout"
 
 module Cohere
   module Transcribe
     class HubTest < Minitest::Test
+      def test_connection_errors_are_part_of_the_public_transient_category
+        assert_operator Hub::ConnectionError, :<, Hub::TransientError
+      end
+
       def test_repository_validation_matches_the_public_model_reference_contract
         hub = Hub.new
         validator = ->(value) { hub.send(:validate_repo_id!, value) }
@@ -114,7 +119,7 @@ module Cohere
           )
           destination = hub.snapshot_path("owner/model", commit).join("weights.bin")
 
-          error = assert_raises(Hub::Error) do
+          error = assert_raises(Hub::TransientError) do
             hub.download("owner/model", "weights.bin", revision: commit)
           end
 
@@ -125,6 +130,42 @@ module Cohere
       ensure
         server&.close
         server_thread&.join
+      end
+
+      def test_malformed_success_metadata_and_redirects_are_transient
+        hub = Hub.new(endpoint: "https://example.invalid")
+        response = http_response(302)
+
+        response["content-length"] = "invalid"
+        assert_raises(Hub::TransientError) do
+          hub.send(:response_content_length, response, URI("https://example.invalid/model"))
+        end
+
+        assert_raises(Hub::TransientError) do
+          hub.send(:resolve_redirect, URI("https://example.invalid/model"), http_response(302))
+        end
+
+        ["http://[", "file:///tmp/model"].each do |location|
+          redirect = http_response(302)
+          redirect["location"] = location
+          assert_raises(Hub::TransientError, location) do
+            hub.send(:resolve_redirect, URI("https://example.invalid/model"), redirect)
+          end
+        end
+
+        assert_raises(Hub::TransientError) do
+          hub.send(:request, URI("https://example.invalid/model"), redirects: 9)
+        end
+      end
+
+      def test_transient_http_status_with_non_object_json_remains_typed
+        [429, 503].each do |status|
+          response = http_response(status, body: "[]")
+
+          assert_raises(Hub::TransientError, status.to_s) do
+            Hub.new.send(:raise_http_error!, response, URI("https://example.invalid/model"))
+          end
+        end
       end
 
       def test_cached_snapshot_symlink_cannot_escape_its_repository
@@ -286,430 +327,114 @@ module Cohere
         assert_equal limit, hub.instance_variable_get(:@resolution_memo).length
       end
 
-      def test_concurrent_revision_lookups_share_one_request
-        Dir.mktmpdir("cohere-hub-coalescing") do |directory|
-          commit = "d" * 40
-          entered_request = Queue.new
-          release_request = Queue.new
-          waiter_entered = Queue.new
-          requests = 0
-          hub = Hub.new(cache_dir: directory, endpoint: "https://example.invalid")
-          hub.define_singleton_method(:request) do |_uri, **_options|
-            requests += 1
-            entered_request << true
-            release_request.pop
-            Struct.new(:body).new(JSON.generate("sha" => commit))
-          end
-
-          first = Thread.new { hub.resolve_revision("owner/model", "main") }
-          entered_request.pop
-          flight = hub.instance_variable_get(:@resolution_flights).values.fetch(0)
-          original_wait = flight.condition.method(:wait)
-          flight.condition.define_singleton_method(:wait) do |*arguments|
-            waiter_entered << true
-            original_wait.call(*arguments)
-          end
-          second = Thread.new { hub.resolve_revision("owner/model", "main") }
-          Timeout.timeout(2) { waiter_entered.pop }
-          release_request << true
-
-          assert_equal [commit, commit], [first.value, second.value]
-          assert_equal 1, requests
-        ensure
-          release_request << true
-          first&.join
-          second&.join
-        end
-      end
-
-      def test_killed_revision_leader_is_not_memoized_and_a_waiter_takes_over
-        Dir.mktmpdir("cohere-hub-killed-leader") do |directory|
-          commit = "e" * 40
-          entered_request = Queue.new
-          release_request = Queue.new
-          waiter_entered = Queue.new
-          requests = 0
-          hub = Hub.new(cache_dir: directory, endpoint: "https://example.invalid")
-          hub.define_singleton_method(:request) do |_uri, **_options|
-            requests += 1
-            entered_request << requests
-            release_request.pop if requests == 1
-            Struct.new(:body).new(JSON.generate("sha" => commit))
-          end
-
-          leader = Thread.new { hub.resolve_revision("owner/model", "main") }
-          assert_equal 1, entered_request.pop
-          instrument_resolution_wait(hub, waiter_entered)
-          waiter = Thread.new { hub.resolve_revision("owner/model", "main") }
-          Timeout.timeout(2) { waiter_entered.pop }
-
-          leader.kill
-          leader.join
-
-          assert_equal 2, Timeout.timeout(2) { entered_request.pop }
-          assert_equal commit, waiter.value
-          assert_equal commit, hub.resolve_revision("owner/model", "main")
-          assert_equal 2, requests
-          assert_empty hub.instance_variable_get(:@resolution_flights)
-          refute_nil hub.instance_variable_get(:@resolution_memo).values.first.value
-        ensure
-          release_request << true
-          leader&.kill
-          leader&.join
-          waiter&.kill
-          waiter&.join
-        end
-      end
-
-      def test_interruption_immediately_after_flight_registration_cannot_leak_the_flight
-        Dir.mktmpdir("cohere-hub-registration-interrupt") do |directory|
-          commit = "f" * 40
-          registered = Queue.new
-          release_registration = Queue.new
-          requests = 0
-          first = true
-          hub = Hub.new(cache_dir: directory, endpoint: "https://example.invalid")
-          original_lead = hub.method(:lead_resolution)
-          hub.define_singleton_method(:lead_resolution) do |*arguments|
-            if first
-              first = false
-              registered << true
-              release_registration.pop
-            end
-            original_lead.call(*arguments)
-          end
-          hub.define_singleton_method(:request) do |_uri, **_options|
-            requests += 1
-            Struct.new(:body).new(JSON.generate("sha" => commit))
-          end
-
-          leader = Thread.new { hub.resolve_revision("owner/model", "main") }
-          registered.pop
-          leader.kill
-          release_registration << true
-          leader.join
-
-          assert_empty hub.instance_variable_get(:@resolution_flights)
-          assert_empty hub.instance_variable_get(:@resolution_memo)
-          assert_equal commit, hub.resolve_revision("owner/model", "main")
-          assert_equal 1, requests
-        ensure
-          release_registration << true
-          leader&.kill
-          leader&.join
-        end
-      end
-
-      def test_killed_revision_leader_during_completion_releases_its_waiters
-        Dir.mktmpdir("cohere-hub-completion-interrupt") do |directory|
-          commit = "2" * 40
-          entered_publish = Queue.new
-          release_publish = Queue.new
-          requests = 0
-          first_publish = true
-          hub = Hub.new(cache_dir: directory, endpoint: "https://example.invalid")
-          original_write_ref = hub.method(:write_ref)
-          hub.define_singleton_method(:write_ref) do |*arguments|
-            if first_publish
-              first_publish = false
-              entered_publish << true
-              release_publish.pop
-            end
-            original_write_ref.call(*arguments)
-          end
-          hub.define_singleton_method(:request) do |_uri, **_options|
-            requests += 1
-            Struct.new(:body).new(JSON.generate("sha" => commit))
-          end
-
-          leader = Thread.new { hub.resolve_revision("owner/model", "main") }
-          entered_publish.pop
-          waiter = Thread.new { hub.resolve_revision("owner/model", "main") }
-          leader.kill
-          leader.join
-
-          assert_equal commit, Timeout.timeout(2) { waiter.value }
-          assert_equal 2, requests
-          assert_empty hub.instance_variable_get(:@resolution_flights)
-        ensure
-          release_publish << true
-          leader&.kill
-          leader&.join
-          waiter&.kill
-          waiter&.join
-        end
-      end
-
-      def test_kill_during_resolution_finalization_cannot_publish_partial_flight_state
-        Dir.mktmpdir("cohere-hub-finalization-kill") do |directory|
-          commit = "6" * 40
-          clock = 100.0
-          requests = 0
-          reached = Queue.new
-          release = Queue.new
-          hub = Hub.new(cache_dir: directory, endpoint: "https://example.invalid")
-          hub.define_singleton_method(:monotonic) { clock }
-          hub.define_singleton_method(:write_ref) { |_repo_id, _revision, _commit| nil }
-          hub.define_singleton_method(:request) do |_uri, **_options|
-            requests += 1
-            Struct.new(:body).new(JSON.generate("sha" => commit))
-          end
-          source_path = hub.method(:finalize_resolution).source_location.fetch(0)
-          pause_line = File.readlines(source_path).index do |line|
-            line.match?(/^\s+flight\.value = final_value$/)
-          end + 1
-          paused = false
-          trace = TracePoint.new(:line) do |event|
-            next unless event.path == source_path && event.lineno == pause_line && !paused
-
-            paused = true
-            reached << true
-            release.pop
-          end
-          leader = Thread.new do
-            trace.enable(target_thread: Thread.current) do
-              hub.resolve_revision("owner/model", "main")
-            end
-          end
-          leader.report_on_exception = false
-
-          Timeout.timeout(2) { reached.pop }
-          leader.kill
-          release << true
-          assert leader.join(2), "revision leader remained stuck during finalization"
-
-          assert_empty hub.instance_variable_get(:@resolution_flights)
-          assert_empty hub.instance_variable_get(:@resolution_publication_guards)
-          assert_equal commit, hub.instance_variable_get(:@resolution_memo).values.fetch(0).value
-          clock += Hub.const_get(:RESOLUTION_MEMO_TTL_SECONDS)
-          assert_equal commit, hub.resolve_revision("owner/model", "main")
-          assert_equal 2, requests
-        ensure
-          trace&.disable
-          release << true
-          leader&.kill
-          leader&.join
-        end
-      end
-
-      def test_kill_during_flight_expiry_cannot_leave_a_partial_timeout_state
-        Dir.mktmpdir("cohere-hub-expiry-kill") do |directory|
-          late_commit = "7" * 40
-          current_commit = "9" * 40
-          entered_request = Queue.new
+      def test_slow_concurrent_revision_lookup_cannot_replace_a_cached_success
+        Dir.mktmpdir("cohere-hub-concurrent-resolution") do |directory|
+          late_commit = "d" * 40
+          current_commit = "e" * 40
+          entered_late_request = Queue.new
           release_late_request = Queue.new
-          reached = Queue.new
-          release_expiry = Queue.new
-          requests = 0
-          hub = Hub.new(cache_dir: directory, endpoint: "https://example.invalid")
-          hub.define_singleton_method(:resolution_flight_wait_seconds) { 0.01 }
-          hub.define_singleton_method(:request) do |_uri, **_options|
-            requests += 1
-            if requests == 1
-              entered_request << true
-              release_late_request.pop
-              Struct.new(:body).new(JSON.generate("sha" => late_commit))
-            else
-              Struct.new(:body).new(JSON.generate("sha" => current_commit))
-            end
-          end
-          source_path = hub.method(:expire_resolution).source_location.fetch(0)
-          pause_line = File.readlines(source_path).index do |line|
-            line.match?(/^\s+flight\.error = timeout_error$/)
-          end + 1
-          paused = false
-          trace = TracePoint.new(:line) do |event|
-            next unless event.path == source_path && event.lineno == pause_line && !paused
-
-            paused = true
-            reached << true
-            release_expiry.pop
-          end
-
-          late_leader = Thread.new { hub.resolve_revision("owner/model", "main") }
-          entered_request.pop
-          waiter = Thread.new do
-            trace.enable(target_thread: Thread.current) do
-              hub.resolve_revision("owner/model", "main")
-            end
-          end
-          waiter.report_on_exception = false
-          Timeout.timeout(2) { reached.pop }
-          waiter.kill
-          release_expiry << true
-          assert waiter.join(2), "revision waiter remained stuck during expiry"
-
-          assert_empty hub.instance_variable_get(:@resolution_flights)
-          assert_equal current_commit, hub.resolve_revision("owner/model", "main")
-          assert_equal 2, requests
-          release_late_request << true
-          assert_equal late_commit, late_leader.value
-          assert_empty hub.instance_variable_get(:@resolution_publication_guards)
-        ensure
-          trace&.disable
-          release_expiry << true
-          release_late_request << true
-          waiter&.kill
-          waiter&.join
-          late_leader&.kill
-          late_leader&.join
-        end
-      end
-
-      def test_kill_during_resolution_cleanup_cannot_leak_a_publication_lane
-        Dir.mktmpdir("cohere-hub-cleanup-kill") do |directory|
-          commit = "a" * 40
-          reached = Queue.new
-          release = Queue.new
-          hub = Hub.new(cache_dir: directory, endpoint: "https://example.invalid")
-          hub.define_singleton_method(:write_ref) { |_repo_id, _revision, _commit| nil }
-          hub.define_singleton_method(:request) do |_uri, **_options|
-            Struct.new(:body).new(JSON.generate("sha" => commit))
-          end
-          source_path = hub.method(:release_resolution_publication).source_location.fetch(0)
-          pause_line = File.readlines(source_path).index do |line|
-            line.match?(/^\s+lane\.owners\.delete\(flight\)$/)
-          end + 1
-          paused = false
-          trace = TracePoint.new(:line) do |event|
-            next unless event.path == source_path && event.lineno == pause_line && !paused
-
-            paused = true
-            reached << true
-            release.pop
-          end
-          leader = Thread.new do
-            trace.enable(target_thread: Thread.current) do
-              hub.resolve_revision("owner/model", "main")
-            end
-          end
-          leader.report_on_exception = false
-
-          Timeout.timeout(2) { reached.pop }
-          leader.kill
-          release << true
-          assert leader.join(2), "revision leader remained stuck during cleanup"
-
-          assert_empty hub.instance_variable_get(:@resolution_flights)
-          assert_empty hub.instance_variable_get(:@resolution_publication_guards)
-          assert_equal commit, hub.instance_variable_get(:@resolution_memo).values.fetch(0).value
-        ensure
-          trace&.disable
-          release << true
-          leader&.kill
-          leader&.join
-        end
-      end
-
-      def test_waiters_retry_instead_of_inheriting_an_abnormal_leader_exception
-        [Interrupt.new("leader interrupted"), SystemExit.new(75)].each do |leader_exception|
-          assert_abnormal_resolution_leader_is_replaced(leader_exception)
-        end
-      end
-
-      def test_timed_out_flight_uses_the_warm_cache_and_a_late_leader_cannot_replace_its_successor
-        Dir.mktmpdir("cohere-hub-flight-timeout") do |directory|
-          cached_commit = cache_snapshot(directory)
-          late_commit = "a" * 40
-          current_commit = "b" * 40
-          entered_request = Queue.new
-          release_late_request = Queue.new
-          requests = 0
-          hub = Hub.new(cache_dir: directory, endpoint: "https://example.invalid")
-          hub.define_singleton_method(:resolution_flight_wait_seconds) { 0.02 }
-          hub.define_singleton_method(:request) do |_uri, **_options|
-            requests += 1
-            entered_request << requests
-            if requests == 1
-              release_late_request.pop
-              Struct.new(:body).new(JSON.generate("sha" => late_commit))
-            else
-              Struct.new(:body).new(JSON.generate("sha" => current_commit))
-            end
-          end
-
-          late_leader = Thread.new { hub.resolve_revision("owner/model", "main") }
-          assert_equal 1, entered_request.pop
-
-          fallback = Timeout.timeout(2) { hub.resolve_revision("owner/model", "main") }
-          assert_equal cached_commit, fallback
-          assert_empty hub.instance_variable_get(:@resolution_flights)
-
-          assert_equal current_commit, hub.resolve_revision("owner/model", "main")
-          assert_equal 2, entered_request.pop
-          release_late_request << true
-          assert_equal late_commit, late_leader.value
-
-          ref = Pathname(directory).join("models--owner--model/refs/main")
-          assert_equal current_commit, ref.read.strip
-          assert_equal current_commit, hub.resolve_revision("owner/model", "main")
-          assert_equal 2, requests
-        ensure
-          release_late_request << true
-          late_leader&.kill
-          late_leader&.join
-        end
-      end
-
-      def test_blocked_ref_publication_does_not_block_deadlines_or_unrelated_revisions
-        Dir.mktmpdir("cohere-hub-publication-lanes") do |directory|
-          cached_commit = cache_snapshot(directory)
-          late_commit = "3" * 40
-          current_commit = "4" * 40
-          unrelated_commit = "5" * 40
-          entered_request = Queue.new
-          entered_publish = Queue.new
-          release_publish = Queue.new
-          requests = 0
           request_guard = Mutex.new
+          requests = 0
           hub = Hub.new(cache_dir: directory, endpoint: "https://example.invalid")
-          hub.define_singleton_method(:resolution_flight_wait_seconds) { 0.02 }
-          original_write_ref = hub.method(:write_ref)
-          hub.define_singleton_method(:write_ref) do |repo_id, revision, commit|
-            if commit == late_commit
-              entered_publish << true
-              release_publish.pop
-            end
-            original_write_ref.call(repo_id, revision, commit)
-          end
-          commits = [late_commit, current_commit, unrelated_commit]
           hub.define_singleton_method(:request) do |_uri, **_options|
             index = request_guard.synchronize do
               current = requests
               requests += 1
               current
             end
-            entered_request << index
-            Struct.new(:body).new(JSON.generate("sha" => commits.fetch(index)))
+            if index.zero?
+              entered_late_request << true
+              release_late_request.pop
+              Struct.new(:body).new(JSON.generate("sha" => late_commit))
+            else
+              Struct.new(:body).new(JSON.generate("sha" => current_commit))
+            end
           end
 
-          late_leader = Thread.new { hub.resolve_revision("owner/model", "main") }
-          assert_equal 0, entered_request.pop
-          entered_publish.pop
+          late = Thread.new { hub.resolve_revision("owner/model", "main") }
+          entered_late_request.pop
+          current = Thread.new { hub.resolve_revision("owner/model", "main") }
 
-          started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-          assert_equal cached_commit, Timeout.timeout(1) { hub.resolve_revision("owner/model", "main") }
-          assert_operator Process.clock_gettime(Process::CLOCK_MONOTONIC) - started, :<, 0.5
+          assert_equal current_commit, Timeout.timeout(2) { current.value }
+          assert_equal current_commit, hub.resolve_revision("owner/model", "main")
+          assert_equal 2, requests
 
-          successor = Thread.new { hub.resolve_revision("owner/model", "main") }
-          assert_equal 1, entered_request.pop
-          assert_equal unrelated_commit,
-                       Timeout.timeout(1) { hub.resolve_revision("other/model", "main") }
-          assert_equal 2, entered_request.pop
-
-          release_publish << true
-          assert_equal late_commit, late_leader.value
-          assert_equal current_commit, successor.value
-          ref = Pathname(directory).join("models--owner--model/refs/main")
-          assert_equal current_commit, ref.read.strip
-          assert_equal 3, requests
-          assert_empty hub.instance_variable_get(:@resolution_publication_guards)
+          release_late_request << true
+          assert_equal current_commit, late.value
+          assert_equal current_commit,
+                       Pathname(directory).join("models--owner--model/refs/main").read.strip
+          assert_equal current_commit, hub.resolve_revision("owner/model", "main")
+          assert_equal 2, requests
         ensure
-          release_publish << true
-          late_leader&.kill
-          late_leader&.join
-          successor&.kill
-          successor&.join
+          release_late_request << true
+          late&.kill
+          late&.join
+          current&.kill
+          current&.join
+        end
+      end
+
+      def test_transient_error_is_public_and_used_for_malformed_revision_responses
+        hub = Hub.new(endpoint: "https://example.invalid")
+        hub.define_singleton_method(:request) do |_uri, **_options|
+          Struct.new(:body).new(JSON.generate("sha" => "short"))
+        end
+
+        error = assert_raises(Hub::TransientError) do
+          hub.resolve_revision("owner/model", "main")
+        end
+
+        assert_match(/no immutable commit/, error.message)
+      end
+
+      def test_malformed_file_lists_raise_a_transient_error
+        commit = "f" * 40
+        bodies = [
+          "{",
+          JSON.generate([]),
+          JSON.generate("siblings" => "missing"),
+          JSON.generate("siblings" => [{}])
+        ]
+
+        bodies.each do |body|
+          hub = Hub.new(endpoint: "https://example.invalid")
+          hub.define_singleton_method(:request) do |_uri, **_options|
+            Struct.new(:body).new(body)
+          end
+
+          assert_raises(Hub::TransientError, body) do
+            hub.list_files("owner/model", revision: commit)
+          end
+        end
+      end
+
+      def test_valid_file_list_is_returned_frozen
+        commit = "f" * 40
+        hub = Hub.new(endpoint: "https://example.invalid")
+        hub.define_singleton_method(:request) do |_uri, **_options|
+          Struct.new(:body).new(
+            JSON.generate("siblings" => [{ "rfilename" => "config.json" }, { "rfilename" => "weights.bin" }])
+          )
+        end
+
+        files = hub.list_files("owner/model", revision: commit)
+
+        assert_equal %w[config.json weights.bin], files
+        assert_predicate files, :frozen?
+      end
+
+      def test_file_list_keeps_authentication_and_not_found_errors_distinct
+        commit = "f" * 40
+        [[401, Hub::AuthenticationError], [403, Hub::AuthenticationError], [404, Hub::NotFoundError]].each do |status, error_class|
+          hub = Hub.new(endpoint: "https://example.invalid")
+          response = http_response(status)
+          hub.define_singleton_method(:request) do |uri, **_options|
+            send(:raise_http_error!, response, uri)
+          end
+
+          assert_raises(error_class, status.to_s) do
+            hub.list_files("owner/model", revision: commit)
+          end
         end
       end
 
@@ -889,58 +614,6 @@ module Cohere
 
       private
 
-      def assert_abnormal_resolution_leader_is_replaced(leader_exception)
-        Dir.mktmpdir("cohere-hub-abnormal-leader") do |directory|
-          commit = "1" * 40
-          entered_request = Queue.new
-          release_request = Queue.new
-          waiter_entered = Queue.new
-          leader_error = Queue.new
-          requests = 0
-          hub = Hub.new(cache_dir: directory, endpoint: "https://example.invalid")
-          hub.define_singleton_method(:request) do |_uri, **_options|
-            requests += 1
-            if requests == 1
-              entered_request << true
-              release_request.pop
-              raise leader_exception
-            end
-            Struct.new(:body).new(JSON.generate("sha" => commit))
-          end
-
-          leader = Thread.new do
-            hub.resolve_revision("owner/model", "main")
-          rescue Exception => e # rubocop:disable Lint/RescueException -- observe abnormal leader termination
-            leader_error << e
-          end
-          entered_request.pop
-          instrument_resolution_wait(hub, waiter_entered)
-          waiter = Thread.new { hub.resolve_revision("owner/model", "main") }
-          Timeout.timeout(2) { waiter_entered.pop }
-          release_request << true
-
-          assert_same leader_exception, leader_error.pop
-          assert_equal commit, waiter.value
-          assert_equal 2, requests
-          assert_empty hub.instance_variable_get(:@resolution_flights)
-        ensure
-          release_request << true
-          leader&.kill
-          leader&.join
-          waiter&.kill
-          waiter&.join
-        end
-      end
-
-      def instrument_resolution_wait(hub, entered)
-        flight = hub.instance_variable_get(:@resolution_flights).values.fetch(0)
-        original_wait = flight.condition.method(:wait)
-        flight.condition.define_singleton_method(:wait) do |*arguments|
-          entered << true
-          original_wait.call(*arguments)
-        end
-      end
-
       def cache_snapshot(directory, repo_id: "owner/model", revision: "main", filename: "config.json")
         commit = "8" * 40
         repository = Pathname(directory).join("models--#{repo_id.gsub("/", "--")}")
@@ -955,10 +628,10 @@ module Cohere
         commit
       end
 
-      def http_response(status)
+      def http_response(status, body: JSON.generate("error" => "fixture failure"))
         response_class = Net::HTTPResponse::CODE_TO_OBJ.fetch(status.to_s)
         response = response_class.new("1.1", status.to_s, "fixture response")
-        response.instance_variable_set(:@body, JSON.generate("error" => "fixture failure"))
+        response.instance_variable_set(:@body, body)
         response.instance_variable_set(:@read, true)
         response
       end

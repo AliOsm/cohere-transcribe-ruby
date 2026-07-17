@@ -651,6 +651,41 @@ module Cohere
           end
         end
 
+        def test_thread_kill_after_the_first_rename_finishes_the_output_set_commit
+          Dir.mktmpdir do |directory|
+            root = Pathname(directory)
+            first = root.join("first.txt")
+            second = root.join("second.txt")
+            first.binwrite("first-old")
+            second.binwrite("second-old")
+            killed = false
+            hook = lambda do |phase, destination|
+              next unless phase == :after_rename && destination == first && !killed
+
+              killed = true
+              publishing_thread = Thread.current
+              Thread.new { publishing_thread.kill }.join
+            end
+            caller = Thread.new do
+              Publication.atomic_write_set(
+                { "first" => first, "second" => second },
+                { "first" => "first-new", "second" => "second-new" },
+                operation_hook: hook
+              )
+            end
+            caller.report_on_exception = false
+
+            assert caller.join(2), "output publisher remained stuck after termination"
+            assert_nil caller.value
+            assert_equal "first-new", first.binread
+            assert_equal "second-new", second.binread
+            assert_empty(root.children.select { |path| %w[.tmp .bak].include?(path.extname) })
+          ensure
+            caller&.kill
+            caller&.join
+          end
+        end
+
         def test_incomplete_output_rollback_preserves_a_backup_when_its_status_cannot_be_read
           original_rename = State::BoundDirectory.instance_method(:rename)
           original_regular_entry = State::BoundDirectory.instance_method(:regular_entry?)

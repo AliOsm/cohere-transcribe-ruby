@@ -89,7 +89,7 @@ module Cohere
             end
           end
 
-          attr_reader :path, :diagnostic
+          attr_reader :path, :diagnostic, :avutil_major
 
           def initialize(path)
             @path = path
@@ -110,6 +110,8 @@ module Cohere
             message[0, ERROR_CAPACITY] = "\0" * ERROR_CAPACITY
             status = @functions.fetch(:probe).call(message, ERROR_CAPACITY)
             @diagnostic = message.to_s.force_encoding(Encoding::UTF_8).scrub.freeze
+            match = @diagnostic.match(/\bavutil\s+(\d+)\b/)
+            @avutil_major = Integer(match[1], 10) if match
             return self if status.zero?
 
             raise TranscriptionRuntimeError, "Native FFmpeg libraries are unavailable: #{@diagnostic}"
@@ -138,7 +140,7 @@ module Cohere
             maximum = max_decoded_bytes || 0
 
             address = 0
-            Thread.handle_interrupt(Exception => :never) do
+            Thread.handle_interrupt(Object => :never) do
               status = @functions.fetch(:decode).call(
                 c_string(path.to_s),
                 sample_rate,
@@ -150,7 +152,7 @@ module Cohere
               )
               address = output_slot[0, Fiddle::SIZEOF_VOIDP].unpack1("J")
               begin
-                Thread.handle_interrupt(Exception => :immediate) do
+                Thread.handle_interrupt(Object => :immediate) do
                   count = count_slot[0, Fiddle::SIZEOF_INT64_T].unpack1("q")
                   detail = message.to_s.force_encoding(Encoding::UTF_8).scrub
                   unless status.zero?
@@ -244,6 +246,12 @@ module Cohere
           library.diagnostic
         rescue TranscriptionRuntimeError => e
           e.message
+        end
+
+        def avutil_major
+          library.avutil_major
+        rescue TranscriptionRuntimeError
+          nil
         end
 
         def decode(path, sample_rate:, max_decoded_bytes:)

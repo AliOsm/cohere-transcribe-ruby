@@ -810,6 +810,86 @@ class Cohere::Transcribe::RuntimeEngineTest < Minitest::Test
     end
   end
 
+  def test_verified_skip_does_not_need_to_create_a_lock_in_a_read_only_output_directory
+    skip "read-only mode bits are unavailable" if Gem.win_platform?
+
+    with_audio_files(1) do |paths, directory|
+      output_dir = Pathname(directory).join("out")
+      overwrite = Cohere::Transcribe::PublicationOptions.new(
+        formats: %w[txt json], output_dir: output_dir, existing: "overwrite"
+      )
+      first = Cohere::Transcribe::Runtime::Engine.new(
+        base_options.with(publication: overwrite),
+        model_provider: FakeProvider.new,
+        decoder: FakeDecoder.new
+      )
+      assert_equal "completed", first.transcribe(paths.first).single.status
+      first.close
+      FileUtils.rm_rf(output_dir.join(".cohere-transcribe-locks"))
+      output_dir.chmod(0o555)
+
+      provider = FakeProvider.new
+      skipped_engine = Cohere::Transcribe::Runtime::Engine.new(
+        base_options.with(publication: overwrite.with(existing: "skip")),
+        model_provider: provider,
+        decoder: FakeDecoder.new(failure: "verified skip must not decode")
+      )
+      skipped = skipped_engine.transcribe(paths.first).single
+      skipped_engine.close
+
+      assert_equal "skipped", skipped.status
+      assert_equal 0, provider.open_count
+      refute output_dir.join(".cohere-transcribe-locks").exist?
+    ensure
+      output_dir&.chmod(0o755) if output_dir&.exist?
+      first&.close
+      skipped_engine&.close
+    end
+  end
+
+  def test_skip_plan_is_revalidated_when_an_output_changes_before_preflight
+    with_audio_files(1) do |paths, directory|
+      output_dir = Pathname(directory).join("out")
+      overwrite = Cohere::Transcribe::PublicationOptions.new(
+        formats: %w[txt json], output_dir: output_dir, existing: "overwrite"
+      )
+      first = Cohere::Transcribe::Runtime::Engine.new(
+        base_options.with(publication: overwrite),
+        model_provider: FakeProvider.new,
+        decoder: FakeDecoder.new
+      )
+      first_result = first.transcribe(paths.first).single
+      first.close
+      changed_output = first_result.outputs.first
+
+      publication = Cohere::Transcribe::Output::Publication
+      original_plan = publication.method(:plan)
+      plan_calls = 0
+      publication.define_singleton_method(:plan) do |*arguments|
+        plans = original_plan.call(*arguments)
+        plan_calls += 1
+        changed_output.binwrite("changed after planning") if plan_calls == 2
+        plans
+      end
+
+      skip_options = overwrite.with(existing: "skip")
+      second = Cohere::Transcribe::Runtime::Engine.new(
+        base_options.with(publication: skip_options),
+        model_provider: FakeProvider.new,
+        decoder: FakeDecoder.new
+      )
+      result = second.transcribe(paths.first).single
+      second.close
+
+      assert_equal "completed", result.status
+      refute_equal "changed after planning", changed_output.binread
+    ensure
+      publication&.define_singleton_method(:plan, original_plan) if original_plan
+      first&.close
+      second&.close
+    end
+  end
+
   def test_render_only_change_reuses_checkpoint_but_asr_change_does_not
     with_audio_files(1) do |paths, directory|
       output_dir = File.join(directory, "out")

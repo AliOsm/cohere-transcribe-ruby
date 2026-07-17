@@ -244,6 +244,55 @@ class Cohere::Transcribe::RuntimePreparationTest < Minitest::Test
     assert_equal 1, attempts.fetch(:unrelated_failure).length
   end
 
+  def test_retry_releases_retained_audio_before_scheduling_a_non_larger_ceiling
+    result = Data.define(:item, :error, :bytes)
+    attempts = Hash.new { |hash, key| hash[key] = [] }
+    pipeline = Pipeline.new(
+      %i[underestimated retained],
+      memory_byte_limit: 100,
+      requested_workers: 2,
+      enabled: true,
+      estimate_bytes: ->(_item) { 10 },
+      exclusive_retry: ->(entry) { entry.error == :estimated_limit },
+      retained_bytes: :bytes.to_proc
+    ) do |item, limit, _slot|
+      attempts[item] << limit
+      if item == :underestimated
+        error = limit < 100 ? :estimated_limit : nil
+        result.new(item: item, error: error, bytes: 0)
+      else
+        result.new(item: item, error: nil, bytes: 100)
+      end
+    end
+
+    yielded = pipeline.map { |entry| [entry.item, entry.error] }
+
+    assert_equal [[:underestimated, nil], [:retained, nil]], yielded
+    assert_equal [25, 100], attempts.fetch(:underestimated)
+    assert_equal [25, 100], attempts.fetch(:retained)
+    refute_includes attempts.fetch(:underestimated), 1
+  end
+
+  def test_retry_does_not_repeat_a_failure_that_already_used_the_full_ceiling
+    result = Data.define(:item, :error)
+    attempts = Hash.new { |hash, key| hash[key] = [] }
+    pipeline = Pipeline.new(
+      %i[first second],
+      memory_byte_limit: 1,
+      requested_workers: 2,
+      enabled: true,
+      exclusive_retry: ->(entry) { entry.error == :limit }
+    ) do |item, limit, _slot|
+      attempts[item] << limit
+      result.new(item: item, error: :limit)
+    end
+
+    yielded = pipeline.map { |entry| [entry.item, entry.error] }
+
+    assert_equal [%i[first limit], %i[second limit]], yielded
+    assert_equal({ first: [1], second: [1] }, attempts)
+  end
+
   def test_estimate_probes_run_on_the_pipeline_callers_native_stack
     caller_fiber = Fiber.current
     observed_fibers = []

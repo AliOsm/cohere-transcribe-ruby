@@ -817,36 +817,30 @@ module Cohere
             )
           end
 
-          inline_payload, output_start = inline_storage_verification(tensor, output)
+          inline_payload = inline_storage_verification(tensor)
           verify_storage_payload!(tensor) unless inline_payload
           remaining = tensor.nbytes
           written = 0
           crc32 = 0 if inline_payload
-          completed = false
-          begin
-            File.open(path, "rb") do |source|
-              source.seek(tensor.data_start)
-              while remaining.positive?
-                requested = [remaining, bytes_per_chunk].min
-                chunk = source.read(requested)
-                raise Error, "Unexpected end of #{path} while reading #{tensor.name.inspect}" if chunk.nil? || chunk.bytesize != requested
+          File.open(path, "rb") do |source|
+            source.seek(tensor.data_start)
+            while remaining.positive?
+              requested = [remaining, bytes_per_chunk].min
+              chunk = source.read(requested)
+              raise Error, "Unexpected end of #{path} while reading #{tensor.name.inspect}" if chunk.nil? || chunk.bytesize != requested
 
-                crc32 = Zlib.crc32(chunk, crc32) if inline_payload
-                converted = converter.convert(chunk, from: tensor.dtype, to: target_dtype)
-                output.write(converted)
-                written += converted.bytesize
-                remaining -= requested
-              end
+              crc32 = Zlib.crc32(chunk, crc32) if inline_payload
+              converted = converter.convert(chunk, from: tensor.dtype, to: target_dtype)
+              output.write(converted)
+              written += converted.bytesize
+              remaining -= requested
             end
-            mark_inline_storage_verified!(tensor.storage_key, inline_payload, crc32) if inline_payload
-            expected = tensor.element_count * Safetensors::DTYPE_BYTES.fetch(target_dtype)
-            raise Error, "Converted tensor #{tensor.name.inspect} wrote #{written} bytes; expected #{expected}" unless written == expected
-
-            completed = true
-            written
-          ensure
-            rollback_inline_output(output, output_start) if output_start && !completed
           end
+          mark_inline_storage_verified!(tensor.storage_key, inline_payload, crc32) if inline_payload
+          expected = tensor.element_count * Safetensors::DTYPE_BYTES.fetch(target_dtype)
+          raise Error, "Converted tensor #{tensor.name.inspect} wrote #{written} bytes; expected #{expected}" unless written == expected
+
+          written
         end
 
         private
@@ -1049,20 +1043,13 @@ module Cohere
           end
         end
 
-        def inline_storage_verification(tensor, output)
-          return [nil, nil] unless output.respond_to?(:pos) && output.respond_to?(:truncate) && output.respond_to?(:seek)
-
+        def inline_storage_verification(tensor)
           payload = @storage_verification_mutex.synchronize do
             @storage_payloads[tensor.storage_key]
           end
-          return [nil, nil] unless payload && tensor.data_start == payload.data_offset && tensor.nbytes == payload.size
+          return unless payload && tensor.data_start == payload.data_offset && tensor.nbytes == payload.size
 
-          position = Integer(output.pos)
-          return [nil, nil] if position.negative?
-
-          [payload, position]
-        rescue ArgumentError, TypeError, SystemCallError
-          [nil, nil]
+          payload
         end
 
         def mark_inline_storage_verified!(storage_key, payload, crc32)
@@ -1070,13 +1057,6 @@ module Cohere
           @storage_verification_mutex.synchronize do
             @storage_payloads.delete(storage_key) if @storage_payloads[storage_key].equal?(payload)
           end
-        end
-
-        def rollback_inline_output(output, position)
-          output.truncate(position)
-          output.seek(position)
-        rescue StandardError
-          nil
         end
 
         def verify_storage_crc!(storage_key, payload)

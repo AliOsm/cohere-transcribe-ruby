@@ -311,6 +311,7 @@ module Cohere
         attr_reader :backend, :batch_capacity, :compute_backend, :device, :last_batch_metrics, :model_path
 
         def initialize(model_path, options, threads: nil, library: NativeLibrary.load)
+          initialized = false
           @library = library
           @model_path = Pathname.new(model_path).expand_path.freeze
           raise TranscriptionRuntimeError, "Native Dense model does not exist: #{@model_path}" unless @model_path.file?
@@ -328,8 +329,8 @@ module Cohere
           thread_count = normalize_threads(threads)
           # An asynchronous exception may become deliverable immediately after
           # the foreign open returns. Defer it until the pointer belongs to the
-          # independent cleanup state, then let the constructor rescue close it.
-          Thread.handle_interrupt(Exception => :never) do
+          # independent cleanup state, then let constructor teardown close it.
+          Thread.handle_interrupt(Object => :never) do
             session = @library.open_session(
               model_path: @model_path,
               device: options.device.to_s,
@@ -367,13 +368,15 @@ module Cohere
             close
             raise TranscriptionRuntimeError, "Native runtime reported an invalid Cohere batch capacity"
           end
-        rescue Exception # rubocop:disable Lint/RescueException -- native ownership must roll back on Interrupt too
-          begin
-            close if defined?(@session_ownership)
-          rescue Exception # rubocop:disable Lint/RescueException -- preserve the constructor failure
-            nil
+          initialized = true
+        ensure
+          unless initialized
+            Thread.handle_interrupt(Object => :never) do
+              close if defined?(@session_ownership)
+            rescue Exception # rubocop:disable Lint/RescueException -- preserve constructor termination
+              nil
+            end
           end
-          raise
         end
 
         def transcribe(samples, language:, offset: 0.0, max_new_tokens: nil)

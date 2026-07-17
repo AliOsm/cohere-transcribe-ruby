@@ -78,6 +78,42 @@ module Cohere
           assert closed_handles.all?(&:positive?)
         end
 
+        def test_kill_after_libsndfile_open_closes_the_handle_before_termination
+          sound_file = Audio.const_get(:SoundFileABI, false)
+          skip "libsndfile is unavailable" unless sound_file.const_get(:AVAILABLE)
+
+          closed_handles = []
+          original_open = sound_file.method(:sf_open)
+          original_close = sound_file.method(:sf_close)
+          open = lambda do |*arguments|
+            handle = original_open.call(*arguments)
+            opening_thread = Thread.current
+            Thread.new { opening_thread.kill }.join
+            handle
+          end
+          close = lambda do |handle|
+            closed_handles << handle.to_i
+            original_close.call(handle)
+          end
+
+          with_wav(sample_rate: 8_000, channels: 2, frames: 400) do |path|
+            replace_singleton_methods(sound_file, sf_open: open, sf_close: close) do
+              replace_singleton_methods(FFmpegNative, available?: -> { false }) do
+                caller = Thread.new { Decoder.probe_duration(path) }
+                caller.report_on_exception = false
+                assert caller.join(2), "libsndfile probe remained stuck after termination"
+                assert_nil caller.value
+              ensure
+                caller&.kill
+                caller&.join
+              end
+            end
+          end
+
+          assert_equal 1, closed_handles.length
+          assert closed_handles.first.positive?
+        end
+
         def test_libsndfile_metadata_allocations_register_release_callbacks
           sound_file = Audio.const_get(:SoundFileABI, false)
           sample_rate = Audio.const_get(:SampleRateABI, false)
@@ -199,6 +235,73 @@ module Cohere
             native = Decoder.decode(path, backend: "ffmpeg")
 
             assert_in_delta native.samples[200], fallback.samples[200], 1e-6
+          end
+        end
+
+        def test_libsndfile_and_native_ffmpeg_match_standard_height_layouts
+          sound_file = Audio.const_get(:SoundFileABI, false)
+          skip "libsndfile is unavailable" unless sound_file.const_get(:AVAILABLE)
+          skip "native FFmpeg audio adapter is unavailable" unless FFmpegNative.available?
+
+          layouts = {
+            "5.1.2" => [0x503f, 8],
+            "5.1.4" => [0x2d03f, 10],
+            "7.1.4" => [0x2d63f, 12]
+          }
+          layouts.each do |name, (channel_mask, channels)|
+            values = Array.new(channels) { |index| (index + 1) * 1_024 }
+            with_wav_extensible(
+              sample_rate: SAMPLE_RATE,
+              channel_values: values,
+              channel_mask: channel_mask
+            ) do |path|
+              fallback = Decoder.decode(path, backend: "libsndfile")
+              native = Decoder.decode(path, backend: "ffmpeg")
+
+              assert_in_delta native.samples[200], fallback.samples[200], 1e-6, name
+            end
+          end
+        end
+
+        def test_libsndfile_and_native_ffmpeg_match_unspecified_standard_layouts_above_eight_channels
+          sound_file = Audio.const_get(:SoundFileABI, false)
+          skip "libsndfile is unavailable" unless sound_file.const_get(:AVAILABLE)
+          skip "native FFmpeg audio adapter is unavailable" unless FFmpegNative.available?
+
+          channels = [10, 12, 16, 24]
+          channels << 14 if FFmpegNative.avutil_major.to_i >= 59
+          channels.sort.each do |channel_count|
+            values = Array.new(channel_count) { |index| (index + 1) * 512 }
+            with_wav(
+              sample_rate: SAMPLE_RATE,
+              channels: channel_count,
+              frames: 400,
+              channel_values: values
+            ) do |path|
+              fallback = Decoder.decode(path, backend: "libsndfile")
+              native = Decoder.decode(path, backend: "ffmpeg")
+
+              assert_in_delta native.samples[200], fallback.samples[200], 1e-6, "#{channel_count} channels"
+            end
+          end
+        end
+
+        def test_unspecified_14_and_16_channel_defaults_follow_the_loaded_ffmpeg_generation
+          old_sixteen = Decoder.const_get(:DEFAULT_MONO_MIXES).fetch(16)
+          seven_fourteen = Decoder.const_get(:FFMPEG_7_DEFAULT_MONO_MIXES).fetch(14)
+          eight_sixteen = Decoder.const_get(:FFMPEG_8_DEFAULT_MONO_MIXES).fetch(16)
+
+          replace_singleton_methods(FFmpegNative, avutil_major: -> { 58 }) do
+            assert_nil Decoder.send(:default_mono_mix, 14)
+            assert_same old_sixteen, Decoder.send(:default_mono_mix, 16)
+          end
+          replace_singleton_methods(FFmpegNative, avutil_major: -> { 59 }) do
+            assert_same seven_fourteen, Decoder.send(:default_mono_mix, 14)
+            assert_same old_sixteen, Decoder.send(:default_mono_mix, 16)
+          end
+          replace_singleton_methods(FFmpegNative, avutil_major: -> { 60 }) do
+            assert_same seven_fourteen, Decoder.send(:default_mono_mix, 14)
+            assert_same eight_sixteen, Decoder.send(:default_mono_mix, 16)
           end
         end
 

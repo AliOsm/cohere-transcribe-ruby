@@ -42,7 +42,11 @@ module Cohere
         class Pipeline
           include Enumerable
 
-          Group = Data.define(:items, :limits, :exclusive)
+          Group = Data.define(:items, :limits, :exclusive) do
+            def self.exclusive(item, limit)
+              new(items: [item].freeze, limits: [limit].freeze, exclusive: true)
+            end
+          end
 
           # Explicit cursor keeps metadata probes on the preparation caller's
           # native stack while preserving lazy current/next-group discovery.
@@ -70,13 +74,8 @@ module Cohere
 
                 item, estimate = pair
                 if estimate > @group_byte_limit
-                  if items.empty?
-                    return Group.new(
-                      items: [item].freeze,
-                      limits: [@memory_byte_limit].freeze,
-                      exclusive: true
-                    )
-                  end
+                  return Group.exclusive(item, @memory_byte_limit) if items.empty?
+
                   @pending = pair
                   break
                 end
@@ -219,7 +218,7 @@ module Cohere
               end
               break unless next_group
 
-              pending ||= submit(next_group, group_index + 1, pool) if next_group
+              pending ||= submit(next_group, group_index + 1, pool)
               group = next_group
               group_index += 1
             end
@@ -283,10 +282,9 @@ module Cohere
           end
 
           def consume_with_exclusive_retry(group, prepared, pool, &block)
-            released = Array.new(prepared.length, false)
             prepared.each_index do |index|
               entry = prepared.fetch(index)
-              if entry.nil? && released.fetch(index)
+              if entry.nil?
                 consume_single_retry(group.items.fetch(index), @memory_byte_limit, pool, &block)
                 next
               end
@@ -300,16 +298,22 @@ module Cohere
               end
 
               prepared[index] = nil
-              collect_released_audio
+              failed_limit = group.limits.fetch(index)
+              if failed_limit >= @memory_byte_limit
+                block.call(entry)
+                next
+              end
               unless @retained_bytes
-                release_retained_entries(prepared, released)
+                release_retained_entries(prepared)
                 collect_released_audio
               end
               limit = available_retry_limit(prepared)
-              retried = prepare_single(group.items.fetch(index), limit, pool)
-              if limit < @memory_byte_limit && @exclusive_retry.call(retried.fetch(0))
-                retried.clear
-                release_retained_entries(prepared, released)
+              retried = prepare_single(group.items.fetch(index), limit, pool) if limit > failed_limit
+              full_retry = retried.nil? ||
+                           (limit < @memory_byte_limit && @exclusive_retry.call(retried.fetch(0)))
+              if full_retry
+                retried&.clear
+                release_retained_entries(prepared)
                 collect_released_audio
                 retried = prepare_single(group.items.fetch(index), @memory_byte_limit, pool)
               end
@@ -324,13 +328,7 @@ module Cohere
           end
 
           def prepare_single(item, limit, pool)
-            pool.prepare(
-              Group.new(
-                items: [item].freeze,
-                limits: [limit].freeze,
-                exclusive: true
-              )
-            )
+            pool.prepare(Group.exclusive(item, limit))
           end
 
           def consume_single_result(retained)
@@ -344,16 +342,15 @@ module Cohere
             return @memory_byte_limit unless @retained_bytes
 
             retained = prepared.compact.sum { |entry| retained_bytes(entry) }
-            [@memory_byte_limit - retained, 1].max
+            [@memory_byte_limit - retained, 0].max
           end
 
-          def release_retained_entries(prepared, released)
+          def release_retained_entries(prepared)
             unless @retained_bytes
               prepared.each_index do |index|
                 next unless prepared[index]
 
                 prepared[index] = nil
-                released[index] = true
               end
               return
             end
@@ -363,7 +360,6 @@ module Cohere
               next unless entry && retained_bytes(entry).positive?
 
               prepared[index] = nil
-              released[index] = true
             end
           end
 

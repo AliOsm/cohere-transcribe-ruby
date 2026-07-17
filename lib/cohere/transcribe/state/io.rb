@@ -12,10 +12,7 @@ module Cohere
       STATE_SUFFIX = ".cohere-transcribe.manifest.json"
       CHECKPOINT_SUFFIX = ".cohere-transcribe.asr.json"
       MAX_STATE_BYTES = 64 * 1024 * 1024
-      DEFERRED_PUBLICATION_EXCEPTIONS = {
-        SignalException => :never,
-        SystemExit => :never
-      }.freeze
+      DEFERRED_PUBLICATION_EXCEPTIONS = { Object => :never }.freeze
 
       class PublicationDirectoryChangedError < TranscriptionRuntimeError; end
       class PublicationEntryError < TranscriptionRuntimeError; end
@@ -283,10 +280,12 @@ module Cohere
         end
 
         def close
-          return if @closed
+          Thread.handle_interrupt(Object => :never) do
+            return if @closed
 
-          @handle.close
-          @closed = true
+            @handle.close
+            @closed = true
+          end
           nil
         end
 
@@ -583,10 +582,10 @@ module Cohere
                 bound.rename(temporary_name, basename)
                 committed = true
               end
+              operation_hook&.call(:after_rename, path)
+              bound.verify!
+              bound.fsync
             end
-            operation_hook&.call(:after_rename, path)
-            bound.verify!
-            bound.fsync
             path
           rescue Exception => e # rubocop:disable Lint/RescueException -- rollback includes interrupts
             primary_failed = true

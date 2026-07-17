@@ -10,7 +10,7 @@ module Cohere
         module_function
 
         def normalize(value)
-          text = value.b.dup.force_encoding(Encoding::UTF_8)
+          text = value.b.force_encoding(Encoding::UTF_8)
           text if text.valid_encoding?
         end
       end

@@ -6,6 +6,7 @@
 /pkg/
 /spec/reports/
 /tmp/
+/lib/cohere/transcribe/native/
 __pycache__/
 *.py[cod]
 

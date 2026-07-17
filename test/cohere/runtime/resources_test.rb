@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "test_helper"
+require "timeout"
 
 class Cohere::Transcribe::RuntimeResourcesTest < Minitest::Test
   Resources = Cohere::Transcribe::Runtime::ModelResources
@@ -162,6 +163,70 @@ class Cohere::Transcribe::RuntimeResourcesTest < Minitest::Test
     refute resources.has_asr?
     assert_nil Resources.current_asr_owner
   ensure
+    resources&.close
+  end
+
+  def test_kill_during_loader_releases_the_claimed_process_lease
+    resources = Resources.new
+    loader_started = Queue.new
+    caller = Thread.new do
+      resources.acquire_asr(%w[cpu fp32]) do
+        loader_started << true
+        sleep
+      end
+    end
+    caller.report_on_exception = false
+
+    loader_started.pop
+    caller.kill
+    assert caller.join(2), "ASR loader remained stuck after termination"
+    assert_nil caller.value
+    refute resources.has_asr?
+    assert_nil Resources.current_asr_owner
+  ensure
+    caller&.kill
+    caller&.join
+    resources&.close
+  end
+
+  def test_kill_after_loader_return_closes_the_session_and_releases_ownership
+    resources = Resources.new
+    session = Session.new
+    source_path = Resources.instance_method(:acquire_asr).source_location.fetch(0)
+    handoff_line = File.readlines(source_path).index do |line|
+      line.include?("raise TranscriptionRuntimeError, \"ASR loader returned no native session\"")
+    end + 1
+    reached = Queue.new
+    release = Queue.new
+    trace = TracePoint.new(:line) do |event|
+      next unless event.path == source_path && event.lineno == handoff_line
+
+      reached << true
+      release.pop
+    end
+    caller = Thread.new do
+      trace.enable(target_thread: Thread.current) do
+        resources.acquire_asr(%w[cpu fp32]) { session }
+      end
+    end
+    caller.report_on_exception = false
+
+    Timeout.timeout(2) { reached.pop }
+    caller.kill
+    Thread.pass
+    assert caller.alive?, "termination interrupted ASR ownership transfer"
+    release << true
+
+    assert caller.join(2), "ASR loader caller remained stuck during rollback"
+    assert_nil caller.value
+    refute resources.has_asr?
+    assert_nil Resources.current_asr_owner
+    assert_equal 1, session.close_count
+  ensure
+    trace&.disable
+    release << true if defined?(release) && release.empty?
+    caller&.kill
+    caller&.join
     resources&.close
   end
 

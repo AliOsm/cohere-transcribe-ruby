@@ -914,25 +914,23 @@ module Cohere
           end
           before_commit&.call
           bound_directories.each_value(&:verify!)
-          staged.each do |destination, (bound, temporary_name)|
-            operation_hook&.call(:before_rename, destination)
-            if rename
-              Thread.handle_interrupt(State::DEFERRED_PUBLICATION_EXCEPTIONS) do
+          Thread.handle_interrupt(State::DEFERRED_PUBLICATION_EXCEPTIONS) do
+            staged.each do |destination, (bound, temporary_name)|
+              operation_hook&.call(:before_rename, destination)
+              if rename
                 committed << destination
                 rename.call(bound.display_path(temporary_name), destination)
                 bound.rename(temporary_name, destination.basename.to_s) if bound.regular_entry?(temporary_name)
-              end
-            else
-              Thread.handle_interrupt(State::DEFERRED_PUBLICATION_EXCEPTIONS) do
+              else
                 bound.rename(temporary_name, destination.basename.to_s)
                 committed << destination
               end
+              operation_hook&.call(:after_rename, destination)
+              bound.verify!
             end
-            operation_hook&.call(:after_rename, destination)
-            bound.verify!
+            bound_directories.each_value(&:fsync)
+            bound_directories.each_value(&:verify!)
           end
-          bound_directories.each_value(&:fsync)
-          bound_directories.each_value(&:verify!)
         rescue Exception => e # rubocop:disable Lint/RescueException -- rollback must include interrupts
           failed = true
           rollback_errors = []

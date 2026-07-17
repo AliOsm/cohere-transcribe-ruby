@@ -377,6 +377,11 @@ module Cohere
         end
 
         def preflight_outcome(index, entry, plan, resolved_options, measurements)
+          if resolved_options.publication&.existing == "skip" && plan.skipped
+            optimistic = Output::Publication.revalidate(plan, resolved_options)
+            return skipped_result(entry, plan) if optimistic.action == :skip
+          end
+
           Output::Publication.with_plan_lock(plan) do
             decision = Output::Publication.revalidate(plan, resolved_options)
             case decision.action

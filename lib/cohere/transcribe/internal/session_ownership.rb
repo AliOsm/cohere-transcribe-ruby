@@ -37,14 +37,16 @@ module Cohere
         end
 
         def close
-          session = @mutex.synchronize do
-            current = @session
-            @session = nil
-            current
-          end
-          return unless session
+          Thread.handle_interrupt(Object => :never) do
+            session = @mutex.synchronize do
+              current = @session
+              @session = nil
+              current
+            end
+            return unless session
 
-          @close.call(session)
+            @close.call(session)
+          end
           nil
         end
 

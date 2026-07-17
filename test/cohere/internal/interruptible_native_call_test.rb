@@ -201,4 +201,52 @@ class Cohere::Transcribe::InterruptibleNativeCallTest < Minitest::Test
     caller&.kill
     caller&.join
   end
+
+  def test_kill_during_soft_interrupt_cleanup_waits_for_the_native_worker
+    started = Queue.new
+    release_worker = Queue.new
+    cleanup_started = Queue.new
+    release_cleanup = Queue.new
+    dedicated_worker = Queue.new
+    cancel_calls = 0
+    caller = Thread.new do
+      Runner.run(
+        cancel: lambda {
+          cancel_calls += 1
+          if cancel_calls == 1
+            cleanup_started << true
+            release_cleanup.pop
+            release_worker << true
+          end
+        },
+        join_interval: 0.001,
+        missing_outcome: RuntimeError.new("missing")
+      ) do
+        dedicated_worker << Thread.current
+        started << true
+        release_worker.pop
+      end
+    end
+    caller.report_on_exception = false
+
+    started.pop
+    worker = dedicated_worker.pop
+    caller.raise(Interrupt, "soft stop")
+    Timeout.timeout(2) { cleanup_started.pop }
+    caller.kill
+    Thread.pass
+    assert caller.alive?, "caller termination interrupted native cleanup"
+
+    release_cleanup << true
+    assert caller.join(2), "caller remained stuck after native cleanup"
+    assert_nil caller.value
+    refute worker.alive?, "dedicated worker survived escalated caller termination"
+    assert_operator cancel_calls, :>=, 1
+  ensure
+    release_cleanup << true if defined?(release_cleanup) && release_cleanup.empty?
+    release_worker << true if defined?(worker) && worker&.alive? && release_worker.empty?
+    worker&.join
+    caller&.kill
+    caller&.join
+  end
 end

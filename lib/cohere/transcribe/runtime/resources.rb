@@ -92,8 +92,8 @@ module Cohere
 
         # Returns [session, loaded]. A key change evicts this instance's prior
         # session, while acquisition also evicts a different process owner.
-        def acquire_asr(key)
-          raise ArgumentError, "an ASR loader block is required" unless block_given?
+        def acquire_asr(key, &loader)
+          raise ArgumentError, "an ASR loader block is required" unless loader
 
           self.class::OWNER_GUARD.synchronize do
             ensure_open!
@@ -102,36 +102,39 @@ module Cohere
 
             owner = self.class.send(:current_owner_locked)
             owner.send(:evict_asr_locked) if owner && !owner.equal?(self)
-            self.class.send(:claim_locked, self)
 
             loaded = false
-            unless @asr_ownership.session
-              installed = false
+            if @asr_ownership.session
+              self.class.send(:claim_locked, self)
+            else
+              completed = false
               session = nil
               begin
-                session = yield
-                raise TranscriptionRuntimeError, "ASR loader returned no native session" if session.nil?
+                Thread.handle_interrupt(Object => :never) do
+                  self.class.send(:claim_locked, self)
+                  session = Thread.handle_interrupt(Object => :on_blocking, &loader)
+                  raise TranscriptionRuntimeError, "ASR loader returned no native session" if session.nil?
 
-                Thread.handle_interrupt(Exception => :never) do
                   @asr_ownership.install(session)
                   @asr_key = owned_key
                   @batch_controller = nil
                   loaded = true
-                  installed = true
                 end
-              rescue Exception # rubocop:disable Lint/RescueException -- roll back asynchronous loader interruption
-                begin
-                  if @asr_ownership.session.equal?(session)
-                    evict_asr_locked
-                  else
-                    session&.close
-                  end
-                rescue Exception # rubocop:disable Lint/RescueException -- preserve the loader failure
-                  nil
-                end
-                raise
+                completed = true
               ensure
-                self.class.send(:release_locked, self) unless installed
+                unless completed
+                  Thread.handle_interrupt(Object => :never) do
+                    if @asr_ownership.session.equal?(session)
+                      evict_asr_locked
+                    else
+                      session&.close
+                    end
+                  rescue Exception # rubocop:disable Lint/RescueException -- preserve loader termination
+                    nil
+                  ensure
+                    self.class.send(:release_locked, self)
+                  end
+                end
               end
             end
             [@asr_ownership.session, loaded].freeze

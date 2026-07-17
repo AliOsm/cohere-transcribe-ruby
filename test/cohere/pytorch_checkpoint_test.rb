@@ -123,14 +123,17 @@ class PyTorchCheckpointTest < Minitest::Test
         end
       end
       reader.singleton_class.prepend(probe)
-      output = StringIO.new(+"prefix".b)
-      output.seek(0, IO::SEEK_END)
+      output_bytes = +"".b
+      output = Object.new
+      output.define_singleton_method(:write) do |bytes|
+        output_bytes << bytes
+        bytes.bytesize
+      end
 
       reader.write_tensor(reader.fetch("flat"), output, target_dtype: "F32", chunk_bytes: 5)
 
       assert_empty separate_checks
-      assert_equal "prefix".b, output.string.byteslice(0, 6)
-      assert_equal (0..5).map(&:to_f), output.string.byteslice(6..).unpack("e*")
+      assert_equal (0..5).map(&:to_f), output_bytes.unpack("e*")
     end
   end
 
@@ -163,7 +166,7 @@ class PyTorchCheckpointTest < Minitest::Test
     end
   end
 
-  def test_inline_crc_failure_rolls_back_a_seekable_output
+  def test_inline_crc_failure_keeps_the_storage_unverified
     Dir.mktmpdir do |directory|
       path = File.join(directory, "pytorch_model.bin")
       tensors = {
@@ -172,17 +175,21 @@ class PyTorchCheckpointTest < Minitest::Test
       write_zip_checkpoint(path, tensors, "0" => [1.0, 2.0, 3.0, 4.0].pack("e*"))
       reader = Checkpoint::Reader.new(path)
       flip_byte(path, reader.fetch("flat").storage_data_start + 12)
-      output = StringIO.new(+"prefix".b)
-      output.seek(0, IO::SEEK_END)
+      output_bytes = +"".b
+      output = Object.new
+      output.define_singleton_method(:write) do |bytes|
+        output_bytes << bytes
+        bytes.bytesize
+      end
 
       2.times do
+        offset = output_bytes.bytesize
         error = assert_raises(Checkpoint::Error) do
           reader.write_tensor(reader.fetch("flat"), output, target_dtype: "F32")
         end
 
         assert_match(/storage "0" failed its CRC check/, error.message)
-        assert_equal "prefix".b, output.string
-        assert_equal 6, output.pos
+        assert_equal 16, output_bytes.bytesize - offset
       end
     end
   end

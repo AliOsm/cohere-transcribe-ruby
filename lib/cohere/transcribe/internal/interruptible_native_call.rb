@@ -14,7 +14,7 @@ module Cohere
 
           outcome = Queue.new
           worker = nil
-          Thread.handle_interrupt(Exception => :on_blocking) do
+          Thread.handle_interrupt(Object => :on_blocking) do
             worker = Thread.new do
               outcome << [:returned, yield]
             rescue Exception => e # rubocop:disable Lint/RescueException -- transfer native cancellation intact
@@ -25,7 +25,7 @@ module Cohere
             worker.join
           ensure
             if worker&.alive?
-              Thread.handle_interrupt(Exception => :never) do
+              Thread.handle_interrupt(Object => :never) do
                 cancel_and_hard_join(worker, cancel, join_interval)
               end
             end

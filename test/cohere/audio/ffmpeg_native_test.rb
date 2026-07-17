@@ -183,6 +183,32 @@ module Cohere
           Fiddle.free(address) if defined?(address) && address && defined?(freed) && freed.empty?
         end
 
+        def test_kill_immediately_after_native_return_releases_the_pcm_buffer_once
+          bytes = 2 * Fiddle::SIZEOF_FLOAT
+          address = Fiddle.malloc(bytes)
+          Fiddle::Pointer.new(address)[0, bytes] = [0.25, -0.25].pack("f*")
+          freed = []
+          decode = lambda do |_path, _sample_rate, _maximum, output_slot, count_slot, _message, _capacity|
+            output_slot[0, Fiddle::SIZEOF_VOIDP] = [address].pack("J")
+            count_slot[0, Fiddle::SIZEOF_INT64_T] = [2].pack("q")
+            worker = Thread.current
+            Thread.new { worker.kill }.join
+            0
+          end
+          library = fake_library(decode: decode, free: lambda { |pointer|
+            freed << pointer
+            Fiddle.free(pointer)
+          })
+
+          error = assert_raises(TranscriptionRuntimeError) do
+            library.decode("fixture.wav", sample_rate: SAMPLE_RATE, max_decoded_bytes: bytes)
+          end
+          assert_match(/without reporting an outcome/, error.message)
+          assert_equal [address], freed
+        ensure
+          Fiddle.free(address) if defined?(address) && address && defined?(freed) && freed.empty?
+        end
+
         def test_native_limit_status_uses_the_typed_limit_error
           decode = lambda do |_path, _sample_rate, _maximum, _output_slot, _count_slot, message, _capacity|
             message[0, 13] = "memory limit\0"

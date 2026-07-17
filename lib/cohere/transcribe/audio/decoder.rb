@@ -128,7 +128,33 @@ module Cohere
           5 => [SQRT_HALF, SQRT_HALF, 1.0, 0.5, 0.5],
           6 => [SQRT_HALF, SQRT_HALF, 1.0, 0.0, 0.5, 0.5],
           7 => [SQRT_HALF, SQRT_HALF, 1.0, 0.0, 0.5, 0.5, 0.5],
-          8 => [SQRT_HALF, SQRT_HALF, 1.0, 0.0, 0.5, 0.5, 0.5, 0.5]
+          8 => [SQRT_HALF, SQRT_HALF, 1.0, 0.0, 0.5, 0.5, 0.5, 0.5],
+          10 => [SQRT_HALF, SQRT_HALF, 1.0, 0.0, 0.5, 0.5, SQRT_HALF, SQRT_HALF, 0.0, 0.0],
+          12 => [
+            SQRT_HALF, SQRT_HALF, 1.0, 0.0, 0.5, 0.5, 0.5, 0.5,
+            SQRT_HALF, SQRT_HALF, 0.0, 0.0
+          ],
+          16 => [
+            SQRT_HALF, SQRT_HALF, 1.0, 0.5, 0.5, 0.5, 0.5, 0.5,
+            SQRT_HALF, 0.0, SQRT_HALF, 0.0, 0.0, 0.0, 0.0, 0.0
+          ],
+          24 => [
+            SQRT_HALF, SQRT_HALF, 1.0, 0.0, 0.5, 0.5, SQRT_HALF, SQRT_HALF,
+            0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+          ]
+        }.transform_values(&:freeze).freeze
+        FFMPEG_7_DEFAULT_MONO_MIXES = {
+          14 => [
+            SQRT_HALF, SQRT_HALF, 1.0, 0.0, 0.5, 0.5, SQRT_HALF, SQRT_HALF,
+            0.5, 0.5, SQRT_HALF, SQRT_HALF, 0.0, 0.0
+          ]
+        }.transform_values(&:freeze).freeze
+        FFMPEG_8_DEFAULT_MONO_MIXES = {
+          16 => [
+            SQRT_HALF, SQRT_HALF, 1.0, 0.0, 0.5, 0.5, SQRT_HALF, SQRT_HALF,
+            0.5, 0.5, SQRT_HALF, SQRT_HALF, 0.0, 0.0, 0.0, 0.0
+          ]
         }.transform_values(&:freeze).freeze
         CHANNEL_POSITION_MONO_MIXES = {
           1 => 1.0,       # mono
@@ -145,7 +171,14 @@ module Cohere
           12 => SQRT_HALF, # front left of center
           13 => SQRT_HALF, # front right of center
           14 => 0.5,      # side left
-          15 => 0.5       # side right
+          15 => 0.5,      # side right
+          16 => 0.0,      # top center
+          17 => SQRT_HALF, # top front left
+          18 => SQRT_HALF, # top front right
+          19 => 0.0,      # top front center
+          20 => 0.0,      # top rear left
+          21 => 0.0,      # top rear right
+          22 => 0.0       # top rear center
         }.freeze
 
         # Best-effort metadata probe used for public skipped-result parity. It
@@ -377,20 +410,21 @@ module Cohere
 
         def with_sound_file(source)
           SoundFileABI::SFInfo.malloc(Fiddle::RUBY_FREE) do |info|
-            handle = SoundFileABI.sf_open(source.to_s, SFM_READ, info.to_ptr)
-            begin
-              yield handle, info
-            ensure
-              SoundFileABI.sf_close(handle) unless handle.null?
+            Thread.handle_interrupt(Object => :never) do
+              handle = SoundFileABI.sf_open(source.to_s, SFM_READ, info.to_ptr)
+              begin
+                Thread.handle_interrupt(Object => :immediate) { yield handle, info }
+              ensure
+                SoundFileABI.sf_close(handle) unless handle.null?
+              end
             end
           end
         end
         private_class_method :with_sound_file
 
-        # libswresample's default mono matrix for av_channel_layout_default
-        # layouts. Formats with more than eight unspecified channels retain a
-        # conservative arithmetic mean because FFmpeg has no common default
-        # layout for them.
+        # libswresample's default mono matrix. Explicit libsndfile positions
+        # preserve height-channel layouts, while the numeric fallbacks mirror
+        # the first standard layout selected by av_channel_layout_default.
         def downmix(interleaved, frames, channels, channel_map)
           return Numo::SFloat.zeros(0) if frames.zero?
           return interleaved if channels == 1
@@ -398,12 +432,28 @@ module Cohere
           matrix = interleaved.reshape(frames, channels)
           weights = channel_map&.map { |position| CHANNEL_POSITION_MONO_MIXES[position] }
           weights = nil if weights&.any?(&:nil?)
-          weights ||= DEFAULT_MONO_MIXES[channels]
+          weights ||= default_mono_mix(channels)
           return matrix.mean(1).cast_to(Numo::SFloat) unless weights
 
           matrix.dot(Numo::SFloat[*weights]).cast_to(Numo::SFloat)
         end
         private_class_method :downmix
+
+        def default_mono_mix(channels)
+          case channels
+          when 14, 16
+            avutil_major = FFmpegNative.avutil_major
+            if avutil_major && avutil_major >= 60 && (weights = FFMPEG_8_DEFAULT_MONO_MIXES[channels])
+              return weights
+            end
+            if avutil_major && avutil_major >= 59 && (weights = FFMPEG_7_DEFAULT_MONO_MIXES[channels])
+              return weights
+            end
+          end
+
+          DEFAULT_MONO_MIXES[channels]
+        end
+        private_class_method :default_mono_mix
 
         def sound_file_channel_map(handle, channels)
           buffer = Array.new(channels, 0).pack("i!*")

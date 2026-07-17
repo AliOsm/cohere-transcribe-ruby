@@ -482,6 +482,35 @@ module Cohere
         assert_raises(Errno::EIO) { State::BoundDirectory.new(nil, handle, []).fsync }
       end
 
+      def test_bound_directory_close_defers_termination_until_the_handle_is_closed
+        close_started = Queue.new
+        finish_close = Queue.new
+        closed = false
+        handle = Object.new
+        handle.define_singleton_method(:close) do
+          close_started << true
+          finish_close.pop
+          closed = true
+        end
+        bound = State::BoundDirectory.new(nil, handle, [])
+        caller = Thread.new { bound.close }
+        caller.report_on_exception = false
+
+        close_started.pop
+        caller.kill
+        assert_nil caller.join(0.05), "termination interrupted directory-handle cleanup"
+
+        finish_close << true
+        assert caller.join(2), "directory close remained stuck"
+        assert_nil caller.value
+        assert closed
+      ensure
+        finish_close << true if defined?(finish_close) && finish_close.empty?
+        caller&.kill
+        caller&.join
+        bound&.close unless closed
+      end
+
       def test_bound_directory_create_temporary_passes_the_mode_at_creation
         arguments, = State::BoundDirectory::AT_FUNCTION_SIGNATURES.fetch(:openat)
         assert_equal Fiddle::TYPE_VARIADIC, arguments.last
@@ -832,6 +861,40 @@ module Cohere
         end
       end
 
+      def test_thread_kill_after_state_rename_finishes_the_marker_commit
+        Dir.mktmpdir("cohere-state-rename-termination") do |directory|
+          root = Pathname(directory)
+          source = root.join("clip.wav")
+          marker = root.join("marker.json")
+          source.binwrite("audio")
+          marker.binwrite("old state")
+          hook = lambda do |phase, _path|
+            next unless phase == :after_rename
+
+            publishing_thread = Thread.current
+            Thread.new { publishing_thread.kill }.join
+          end
+          caller = Thread.new do
+            State.write_state_atomic(
+              marker,
+              { "kind" => "new" },
+              source_snapshot: State::SourceSnapshot.capture(source),
+              directory_binding: State::DirectoryBinding.capture(root),
+              operation_hook: hook
+            )
+          end
+          caller.report_on_exception = false
+
+          assert caller.join(2), "state publisher remained stuck after termination"
+          assert_nil caller.value
+          assert_includes marker.binread, '"kind": "new"'
+          assert_empty(root.children.select { |path| %w[.tmp .bak].include?(path.extname) })
+        ensure
+          caller&.kill
+          caller&.join
+        end
+      end
+
       def test_output_lock_identity_is_output_adjacent_and_independent_of_cache_environment
         Dir.mktmpdir("cohere-lock-cache-paths") do |directory|
           root = Pathname(directory)
@@ -884,11 +947,12 @@ module Cohere
         end
       end
 
-      def test_output_lock_creates_an_output_adjacent_registry_with_expected_mode
+      def test_output_lock_creates_an_output_adjacent_registry_with_parent_sharing_mode
         Dir.mktmpdir("cohere-lock-nested-cache") do |directory|
           root = Pathname(directory)
           output_parent = root.join("nested/outputs")
           FileUtils.mkdir_p(output_parent)
+          output_parent.chmod(0o770) unless Gem.win_platform?
           with_lock_cache_environment("HOME" => root.join("home").to_s) do
             target = State.lock_target_for_outputs(
               "txt" => output_parent.join("clip.txt")
@@ -899,7 +963,10 @@ module Cohere
             lock = State::OutputSetLock.acquire(target)
             begin
               assert_predicate target.path.dirname, :directory?
-              assert_equal 0, target.path.dirname.stat.mode & 0o077 unless Gem.win_platform?
+              unless Gem.win_platform?
+                assert_equal 0o770, target.path.dirname.stat.mode & 0o777
+                assert_equal 0o660, target.path.stat.mode & 0o777
+              end
               assert_equal 23, run_lock_child(target)
             ensure
               lock.release
@@ -907,6 +974,79 @@ module Cohere
             assert_equal 0, run_lock_child(target)
           end
         end
+      end
+
+      def test_output_lock_accepts_an_existing_non_private_adjacent_registry
+        Dir.mktmpdir("cohere-lock-shared-registry") do |directory|
+          output_parent = Pathname(directory).join("outputs")
+          output_parent.mkdir
+          target = State.lock_target_for_outputs("txt" => output_parent.join("clip.txt"))
+          target.path.dirname.mkdir(0o755)
+          target.path.dirname.chmod(0o755) unless Gem.win_platform?
+
+          lock = State::OutputSetLock.acquire(target)
+          begin
+            assert_equal 23, run_lock_child(target)
+          ensure
+            lock.release
+          end
+          assert_equal 0, run_lock_child(target)
+        end
+      end
+
+      def test_output_lock_reconciles_an_owned_private_registry_for_a_shared_parent
+        skip "mode bits are unavailable" if Gem.win_platform?
+
+        Dir.mktmpdir("cohere-lock-owned-registry") do |directory|
+          output_parent = Pathname(directory).join("outputs")
+          output_parent.mkdir
+          output_parent.chmod(0o770)
+          target = State.lock_target_for_outputs("txt" => output_parent.join("clip.txt"))
+          target.path.dirname.mkdir(0o700)
+          target.path.binwrite("")
+          target.path.chmod(0o600)
+
+          lock = State::OutputSetLock.acquire(target)
+          lock.release
+
+          assert_equal 0o770, target.path.dirname.stat.mode & 0o777
+          assert_equal 0o660, target.path.stat.mode & 0o777
+        end
+      end
+
+      def test_output_lock_can_flock_an_existing_read_only_adjacent_file
+        skip "read-only mode bits are unavailable" if Gem.win_platform?
+
+        Dir.mktmpdir("cohere-lock-readonly-file") do |directory|
+          output_parent = Pathname(directory).join("outputs")
+          output_parent.mkdir
+          target = State.lock_target_for_outputs("txt" => output_parent.join("clip.txt"))
+          target.path.dirname.mkdir(0o755)
+          target.path.binwrite("")
+          target.path.chmod(0o444)
+
+          lock = State::OutputSetLock.acquire(target)
+          begin
+            assert_equal 0o444, target.path.stat.mode & 0o777
+            assert_equal 23, run_lock_child(target)
+          ensure
+            lock.release
+          end
+        ensure
+          target&.path&.chmod(0o600) if target&.path&.exist?
+        end
+      end
+
+      def test_output_lock_tolerates_a_filesystem_that_cannot_apply_modes
+        unsupported = if defined?(Errno::EOPNOTSUPP)
+                        Errno::EOPNOTSUPP.new("mode unavailable")
+                      else
+                        Errno::EPERM.new("mode unavailable")
+                      end
+        target = Object.new
+        target.define_singleton_method(:chmod) { |_mode| raise unsupported }
+
+        assert_nil State.apply_lock_mode_if_supported(target, 0o770)
       end
 
       def test_output_lock_contends_with_the_released_previous_registry_location
@@ -931,6 +1071,7 @@ module Cohere
 
               lock = State::OutputSetLock.acquire(target)
               begin
+                assert_equal "#{Process.pid}\n", legacy_paths.first.binread
                 assert_equal 23, run_lock_child(legacy_target)
               ensure
                 lock.release
@@ -977,7 +1118,7 @@ module Cohere
         events = []
         cleanup_failure = Errno::EIO.new("unlock failed")
         handle = fake_lock_handle("candidate", events, unlock_error: cleanup_failure)
-        State.define_singleton_method(:open_lock_file) { |_path| handle }
+        State.define_singleton_method(:open_lock_file) { |_path, **| handle }
         primary_failure = Class.new(StandardError)
         target = State::OutputLockTarget.new(path: Pathname("/unused/custom.lock"), identity: "test output")
 
@@ -993,6 +1134,29 @@ module Cohere
         assert_empty State::OutputSetLock.active
       ensure
         State.define_singleton_method(:open_lock_file, original_open_lock_file) if original_open_lock_file
+      end
+
+      def test_output_lock_acquired_inside_a_rescue_remains_held
+        Dir.mktmpdir("cohere-lock-rescue-context") do |directory|
+          target = State.lock_target_for_outputs(
+            "txt" => Pathname(directory).join("clip.txt")
+          )
+          lock = nil
+          begin
+            raise "primary work failed"
+          rescue RuntimeError => e
+            assert_same e, $! # rubocop:disable Style/SpecialGlobalVars
+            lock = State::OutputSetLock.acquire(target)
+            refute lock.released?
+            assert_equal 2, State::OutputSetLock.active.length
+            assert_equal 23, run_lock_child(target)
+          ensure
+            lock&.release
+          end
+
+          assert_empty State::OutputSetLock.active
+          assert_equal 0, run_lock_child(target)
+        end
       end
 
       def test_output_lock_registration_failure_removes_every_key_and_unlocks_every_path
@@ -1076,8 +1240,105 @@ module Cohere
         cleanup_error = assert_raises(Errno::EIO) { State.with_output_lock(target) { :completed } }
         assert_same release_failure, cleanup_error
         assert_equal 2, release_calls
+        return_error = assert_raises(Errno::EIO) { return_from_output_lock(target) }
+        assert_same release_failure, return_error
+        assert_equal 3, release_calls
       ensure
         State::OutputSetLock.define_singleton_method(:acquire, original_acquire) if original_acquire
+      end
+
+      def test_kill_remains_deliverable_inside_output_lock_work_and_releases_the_lock
+        Dir.mktmpdir("cohere-lock-protected-kill") do |directory|
+          target = State.lock_target_for_outputs(
+            "txt" => Pathname(directory).join("clip.txt")
+          )
+          entered = Queue.new
+          caller = Thread.new do
+            State.with_output_lock(target) do
+              entered << true
+              sleep
+            end
+          end
+          caller.report_on_exception = false
+
+          entered.pop
+          caller.kill
+          assert caller.join(2), "output-lock work did not accept termination"
+          assert_nil caller.value
+          assert_empty State::OutputSetLock.active
+          assert_equal 0, run_lock_child(target)
+        ensure
+          caller&.kill
+          caller&.join
+        end
+      end
+
+      def test_kill_during_soft_interrupt_release_waits_for_lock_cleanup
+        original_acquire = State::OutputSetLock.method(:acquire)
+        work_started = Queue.new
+        release_started = Queue.new
+        finish_release = Queue.new
+        released = false
+        fake_lock = Object.new
+        fake_lock.define_singleton_method(:release) do
+          release_started << true
+          finish_release.pop
+          released = true
+        end
+        State::OutputSetLock.define_singleton_method(:acquire) do |_target, **keywords|
+          keywords.fetch(:ownership_hook).call(fake_lock)
+          fake_lock
+        end
+        target = State::OutputLockTarget.new(path: Pathname("/unused/custom.lock"), identity: "test output")
+        caller = Thread.new do
+          State.with_output_lock(target) do
+            work_started << true
+            sleep
+          end
+        end
+        caller.report_on_exception = false
+
+        work_started.pop
+        caller.raise(Interrupt, "soft stop")
+        Timeout.timeout(2) { release_started.pop }
+        caller.kill
+        Thread.pass
+        assert caller.alive?, "termination interrupted output-lock cleanup"
+
+        finish_release << true
+        assert caller.join(2), "output-lock caller remained stuck after cleanup"
+        assert_nil caller.value
+        assert released
+      ensure
+        finish_release << true if defined?(finish_release) && finish_release.empty?
+        caller&.kill
+        caller&.join
+        State::OutputSetLock.define_singleton_method(:acquire, original_acquire) if original_acquire
+      end
+
+      def test_unsupported_flock_failure_is_wrapped_as_a_runtime_error
+        original_open_lock_file = State.method(:open_lock_file)
+        events = []
+        handle = fake_lock_handle("candidate", events)
+        handle.define_singleton_method(:flock) do |operation|
+          events << ["candidate", operation == File::LOCK_UN ? :unlock : :lock]
+          raise Errno::ENOLCK, "flock unavailable" unless operation == File::LOCK_UN
+
+          true
+        end
+        State.define_singleton_method(:open_lock_file) { |_path, **| handle }
+        target = State::OutputLockTarget.new(path: Pathname("/unused/custom.lock"), identity: "test output")
+
+        error = assert_raises(TranscriptionRuntimeError) do
+          State::OutputSetLock.acquire(target)
+        end
+
+        assert_match(/Cannot acquire output lock/, error.message)
+        assert_instance_of Errno::ENOLCK, error.cause
+        assert_equal [["candidate", :lock], ["candidate", :unlock], ["candidate", :close]], events
+        assert_empty State::OutputSetLock.active
+      ensure
+        State.define_singleton_method(:open_lock_file, original_open_lock_file) if original_open_lock_file
       end
 
       def test_output_lock_contends_across_different_cache_environments
@@ -1236,6 +1497,29 @@ module Cohere
         end
       end
 
+      def test_kill_after_lock_file_open_registers_and_closes_the_handle
+        original_open_lock_file = State.method(:open_lock_file)
+        events = []
+        handle = fake_lock_handle("candidate", events)
+        State.define_singleton_method(:open_lock_file) do |_path, **|
+          opening_thread = Thread.current
+          Thread.new { opening_thread.kill }.join
+          handle
+        end
+        target = State::OutputLockTarget.new(path: Pathname("/unused/custom.lock"), identity: "test output")
+        caller = Thread.new { State::OutputSetLock.acquire(target) }
+        caller.report_on_exception = false
+
+        assert caller.join(2), "lock acquisition remained stuck after termination"
+        assert_nil caller.value
+        assert_equal [["candidate", :unlock], ["candidate", :close]], events
+        assert_empty State::OutputSetLock.active
+      ensure
+        caller&.kill
+        caller&.join
+        State.define_singleton_method(:open_lock_file, original_open_lock_file) if original_open_lock_file
+      end
+
       def test_sequential_many_stem_locks_do_not_accumulate_descriptors
         skip "Linux file descriptor accounting is unavailable" unless Pathname("/proc/self/fd").directory?
 
@@ -1285,6 +1569,10 @@ module Cohere
             nil
           end
         end
+      end
+
+      def return_from_output_lock(target)
+        State.with_output_lock(target) { return :returned }
       end
 
       def published_manifest_fixture(root)
