@@ -2,6 +2,7 @@
 
 require "test_helper"
 require "cohere/transcribe/internal/interruptible_native_call"
+require "timeout"
 
 class Cohere::Transcribe::InterruptibleNativeCallTest < Minitest::Test
   Runner = Cohere::Transcribe::Internal::InterruptibleNativeCall
@@ -119,5 +120,85 @@ class Cohere::Transcribe::InterruptibleNativeCallTest < Minitest::Test
     caller&.kill
     caller&.join
     interrupter&.join
+  end
+
+  def test_killing_the_caller_cancels_and_joins_the_dedicated_worker
+    started = Queue.new
+    release = Queue.new
+    dedicated_worker = Queue.new
+    cancel_calls = 0
+    caller = Thread.new do
+      Runner.run(
+        cancel: lambda {
+          cancel_calls += 1
+          raise "first cancel failed" if cancel_calls == 1
+
+          release << true if cancel_calls == 3
+        },
+        join_interval: 0.001,
+        missing_outcome: RuntimeError.new("missing")
+      ) do
+        dedicated_worker << Thread.current
+        started << true
+        release.pop
+        raise "worker failed during cancellation"
+      end
+    end
+    caller.report_on_exception = false
+
+    started.pop
+    worker = dedicated_worker.pop
+    caller.kill
+
+    assert caller.join(2), "caller remained stuck while cleaning up its dedicated worker"
+    assert_nil caller.value
+    refute worker.alive?, "dedicated worker survived caller termination"
+    assert_operator cancel_calls, :>=, 3
+  ensure
+    release << true if defined?(worker) && worker&.alive?
+    worker&.join
+    caller&.kill
+    caller&.join
+  end
+
+  def test_killing_the_caller_between_worker_creation_and_join_cleans_up_the_worker
+    helper_path = Runner.method(:run).source_location.fetch(0)
+    metadata_line = File.readlines(helper_path).index { |line| line.include?("worker.name =") } + 1
+    reached = Queue.new
+    release = Queue.new
+    cancel_calls = 0
+    trace = TracePoint.new(:line) do |event|
+      next unless event.path == helper_path && event.lineno == metadata_line
+
+      reached << event.binding.local_variable_get(:worker)
+      sleep
+    end
+    caller = Thread.new do
+      trace.enable(target_thread: Thread.current) do
+        Runner.run(
+          cancel: lambda {
+            cancel_calls += 1
+            release << true
+          },
+          join_interval: 0.001,
+          missing_outcome: RuntimeError.new("missing")
+        ) { release.pop }
+      end
+    end
+    caller.report_on_exception = false
+
+    worker = Timeout.timeout(2) { reached.pop }
+    caller.kill
+
+    assert caller.join(2), "caller remained stuck during pre-join cleanup"
+    assert_nil caller.value
+    refute worker.alive?, "dedicated worker survived termination before join"
+    assert_operator cancel_calls, :>=, 1
+  ensure
+    trace&.disable
+    release << true if defined?(worker) && worker&.alive?
+    worker&.join
+    caller&.kill
+    caller&.join
   end
 end

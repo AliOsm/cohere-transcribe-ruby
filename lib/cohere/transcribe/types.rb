@@ -1,10 +1,13 @@
 # frozen_string_literal: true
 
+require_relative "constants"
+require_relative "internal/utf8"
+
 module Cohere
   module Transcribe
     module TypesSupport
-      DEFAULT_ASR_MODEL_ID = "CohereLabs/cohere-transcribe-arabic-07-2026"
-      OUTPUT_FORMATS = %w[txt srt vtt json].freeze
+      DEFAULT_ASR_MODEL_ID = Cohere::Transcribe::DEFAULT_ASR_MODEL_ID
+      OUTPUT_FORMATS = Cohere::Transcribe::OUTPUT_FORMATS
       EXISTING_POLICIES = %w[error overwrite skip].freeze
 
       module KeywordOnlyConstructor
@@ -51,16 +54,16 @@ module Cohere
         source = value.respond_to?(:to_path) ? value.to_path : value
         return immutable(value) unless source.is_a?(String)
 
-        text = source.b.dup.force_encoding(Encoding::UTF_8)
-        text.valid_encoding? ? text.freeze : immutable(source)
+        text = Internal::UTF8.normalize(source)
+        text ? text.freeze : immutable(source)
       end
 
       def path(value, field: "path")
         source = value.respond_to?(:to_path) ? value.to_path : value
         raise TypeError, "#{field} must resolve to a text path" unless source.is_a?(String)
 
-        text = source.b.dup.force_encoding(Encoding::UTF_8)
-        raise ArgumentError, "#{field} must contain valid UTF-8" unless text.valid_encoding?
+        text = Internal::UTF8.normalize(source)
+        raise ArgumentError, "#{field} must contain valid UTF-8" unless text
 
         absolute = text.start_with?("/")
         prefix = if text.start_with?("//") && !text.start_with?("///")

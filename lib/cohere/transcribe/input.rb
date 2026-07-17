@@ -4,6 +4,7 @@ require "find"
 
 require_relative "constants"
 require_relative "errors"
+require_relative "internal/utf8"
 require_relative "python_text"
 
 module Cohere
@@ -113,8 +114,8 @@ module Cohere
       private_class_method :path_like?
 
       def utf8_path(value, label)
-        text = value.b.dup.force_encoding(Encoding::UTF_8)
-        return text if text.valid_encoding?
+        text = Internal::UTF8.normalize(value)
+        return text if text
 
         raise TranscriptionInputError, "#{label} path must contain valid UTF-8"
       end

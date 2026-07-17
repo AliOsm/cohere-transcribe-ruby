@@ -267,6 +267,9 @@ module Cohere
             estimate_bytes: estimate_bytes,
             exclusive_retry: lambda do |prepared|
               prepared.error.is_a?(Audio::DecodedAudioLimitError)
+            end,
+            retained_bytes: lambda do |prepared|
+              prepared.decoded ? prepared.decoded.samples.byte_size : 0
             end
           ) do |item, decoded_byte_limit, worker_slot|
             prepare_entry(

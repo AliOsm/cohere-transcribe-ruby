@@ -3,7 +3,7 @@
 module Cohere
   module Transcribe
     module Internal
-      # Runs a blocking foreign call on a private worker so the caller remains
+      # Runs a blocking foreign call on a dedicated worker so the caller remains
       # interruptible. Callbacks are retained only for this invocation; callers
       # remain responsible for supplying non-poisoning cancellation behavior.
       module InterruptibleNativeCall
@@ -22,12 +22,12 @@ module Cohere
             end
             worker.name = thread_name if thread_name && worker.respond_to?(:name=)
             worker.report_on_exception = false
-
-            begin
-              worker.join
-            rescue Exception => e # rubocop:disable Lint/RescueException -- caller cancellation must win
-              cancel_and_hard_join(worker, cancel, join_interval)
-              raise e
+            worker.join
+          ensure
+            if worker&.alive?
+              Thread.handle_interrupt(Exception => :never) do
+                cancel_and_hard_join(worker, cancel, join_interval)
+              end
             end
           end
 

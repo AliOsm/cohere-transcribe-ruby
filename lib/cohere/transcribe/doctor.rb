@@ -1,13 +1,14 @@
 # frozen_string_literal: true
 
 require "optparse"
+require_relative "constants"
 require_relative "version"
 
 module Cohere
   module Transcribe
     # Installation and model-metadata diagnostics that never load ASR weights.
     module Doctor
-      DEFAULT_MODEL_ID = "CohereLabs/cohere-transcribe-arabic-07-2026"
+      DEFAULT_MODEL_ID = DEFAULT_ASR_MODEL_ID
       EXPECTED_ONNX_SHA256 = "914fd98ac0a73d69ba1e70c9b1d66acb740eff90500dfde08b89a961b168a6a9"
       COHERE_PROCESSOR_CLASS = "CohereAsrProcessor"
       COHERE_FEATURE_EXTRACTOR_CLASS = "CohereAsrFeatureExtractor"

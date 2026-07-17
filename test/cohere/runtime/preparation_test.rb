@@ -181,8 +181,8 @@ class Cohere::Transcribe::RuntimePreparationTest < Minitest::Test
     assert_equal %i[before large after], yielded
   end
 
-  def test_underestimated_group_is_retried_sequentially_with_the_full_budget
-    result = Data.define(:item, :error)
+  def test_underestimated_entry_retries_without_redecoding_a_retained_success
+    result = Data.define(:item, :error, :bytes)
     attempts = []
     items = [[:first, 23], [:second, 23]]
     pipeline = Pipeline.new(
@@ -191,11 +191,12 @@ class Cohere::Transcribe::RuntimePreparationTest < Minitest::Test
       requested_workers: 2,
       enabled: true,
       estimate_bytes: ->(item) { item.fetch(1) },
-      exclusive_retry: ->(entry) { entry.error == :estimated_limit }
+      exclusive_retry: ->(entry) { entry.error == :estimated_limit },
+      retained_bytes: :bytes.to_proc
     ) do |item, limit, _slot|
       attempts << [item.first, limit]
       error = item.first == :first && limit < 26 ? :estimated_limit : nil
-      result.new(item: item.first, error: error)
+      result.new(item: item.first, error: error, bytes: error ? 0 : item.fetch(1))
     end
 
     yielded = pipeline.map { |entry| [entry.item, entry.error] }
@@ -203,8 +204,62 @@ class Cohere::Transcribe::RuntimePreparationTest < Minitest::Test
     second_limits = attempts.filter_map { |name, limit| limit if name == :second }
 
     assert_equal [[:first, nil], [:second, nil]], yielded
-    assert_equal [25, 100], first_limits
-    assert_equal [25, 100], second_limits
+    assert_equal [25, 77], first_limits
+    assert_equal [25], second_limits
+  end
+
+  def test_retry_releases_only_retained_audio_when_the_remaining_budget_is_still_too_small
+    result = Data.define(:item, :error, :bytes)
+    attempts = Hash.new { |hash, key| hash[key] = [] }
+    pipeline = Pipeline.new(
+      %i[underestimated retained unrelated_failure],
+      memory_byte_limit: 100,
+      requested_workers: 3,
+      enabled: true,
+      estimate_bytes: ->(_item) { 10 },
+      exclusive_retry: ->(entry) { entry.error == :estimated_limit },
+      retained_bytes: :bytes.to_proc
+    ) do |item, limit, _slot|
+      attempts[item] << limit
+      case item
+      when :underestimated
+        error = limit < 95 ? :estimated_limit : nil
+        result.new(item: item, error: error, bytes: 0)
+      when :retained
+        result.new(item: item, error: nil, bytes: 10)
+      else
+        result.new(item: item, error: :decode_failure, bytes: 0)
+      end
+    end
+
+    yielded = pipeline.map { |entry| [entry.item, entry.error] }
+
+    assert_equal [
+      [:underestimated, nil],
+      [:retained, nil],
+      %i[unrelated_failure decode_failure]
+    ], yielded
+    assert_equal [90, 100], attempts.fetch(:underestimated).last(2)
+    assert_equal 2, attempts.fetch(:retained).length
+    assert_equal 1, attempts.fetch(:unrelated_failure).length
+  end
+
+  def test_estimate_probes_run_on_the_pipeline_callers_native_stack
+    caller_fiber = Fiber.current
+    observed_fibers = []
+    pipeline = Pipeline.new(
+      (0...6).to_a,
+      memory_byte_limit: 1_000,
+      requested_workers: 2,
+      enabled: true,
+      estimate_bytes: lambda do |_item|
+        observed_fibers << Fiber.current
+        10
+      end
+    ) { |item, _limit, _slot| item }
+
+    assert_equal (0...6).to_a, pipeline.to_a
+    assert_equal [caller_fiber], observed_fibers.uniq
   end
 
   def test_unknown_sizes_share_an_ordinary_group_and_retry_on_the_worker_pool
@@ -334,6 +389,56 @@ class Cohere::Transcribe::RuntimePreparationTest < Minitest::Test
     refute(Thread.list.any? { |thread| thread.name&.start_with?("cohere-audio-") })
   ensure
     native&.define_singleton_method(:cancel_active!) { original_cancel.call }
+  end
+
+  def test_pipeline_teardown_joins_a_dedicated_native_worker
+    started = Queue.new
+    release = Queue.new
+    dedicated_worker = Queue.new
+    cancel_calls = 0
+    pipeline = Pipeline.new(
+      %i[first second],
+      memory_byte_limit: 100,
+      requested_workers: 1,
+      enabled: true
+    ) do |item, _limit, _slot|
+      next item if item == :first
+
+      Cohere::Transcribe::Internal::InterruptibleNativeCall.run(
+        cancel: lambda {
+          cancel_calls += 1
+          release << true if cancel_calls == 1
+        },
+        join_interval: 0.001,
+        missing_outcome: RuntimeError.new("missing")
+      ) do
+        dedicated_worker << Thread.current
+        started << true
+        release.pop
+        raise "worker failed during cancellation"
+      end
+    end
+    worker = nil
+
+    error = assert_raises(RuntimeError) do
+      pipeline.each do |item|
+        next unless item == :first
+
+        Timeout.timeout(2) do
+          started.pop
+          worker = dedicated_worker.pop
+        end
+        raise "abort consumer"
+      end
+    end
+
+    assert_equal "abort consumer", error.message
+    assert_operator cancel_calls, :>=, 1
+    refute worker.alive?, "dedicated worker survived pipeline teardown"
+    refute(Thread.list.any? { |thread| thread.name&.start_with?("cohere-audio-") })
+  ensure
+    release << true if defined?(worker) && worker&.alive?
+    worker&.join
   end
 
   def test_worker_interrupt_propagates_and_sibling_workers_are_joined

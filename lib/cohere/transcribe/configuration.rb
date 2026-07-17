@@ -2,6 +2,7 @@
 
 require_relative "constants"
 require_relative "errors"
+require_relative "internal/utf8"
 require_relative "model_identity"
 require_relative "python_text"
 require_relative "types"
@@ -240,8 +241,8 @@ module Cohere
       private_class_method :validate_revision!
 
       def validated_utf8_text(value, option)
-        text = value.b.dup.force_encoding(Encoding::UTF_8)
-        invalid!("#{option} must contain valid UTF-8") unless text.valid_encoding?
+        text = Internal::UTF8.normalize(value)
+        invalid!("#{option} must contain valid UTF-8") unless text
 
         text
       end

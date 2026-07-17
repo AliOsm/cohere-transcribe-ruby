@@ -2,6 +2,7 @@
 
 require "json"
 require_relative "constants"
+require_relative "internal/utf8"
 
 module Cohere
   module Transcribe
@@ -60,8 +61,8 @@ module Cohere
       end
 
       def utf8_resolved_path(value, description)
-        text = value.b.dup.force_encoding(Encoding::UTF_8)
-        return text if text.valid_encoding?
+        text = Internal::UTF8.normalize(value)
+        return text if text
 
         raise ArgumentError, "#{description} resolved path must contain valid UTF-8"
       end

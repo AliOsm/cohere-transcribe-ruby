@@ -23,11 +23,22 @@ module Cohere
       DEFAULT_ENDPOINT = "https://huggingface.co"
       RESOLUTION_MEMO_TTL_SECONDS = 5.0
       RESOLUTION_MEMO_LIMIT = 64
+      RESOLUTION_FLIGHT_WAIT_SECONDS = 330.0
       ResolutionMemo = Struct.new(:value, :error, :expires_at, keyword_init: true)
-      ResolutionFlight = Struct.new(:condition, :complete, :value, :error, keyword_init: true)
+      ResolutionPublicationLane = Struct.new(:mutex, :owners, keyword_init: true)
+      ResolutionFlight = Struct.new(
+        :condition,
+        :publication_lane,
+        :state,
+        :value,
+        :error,
+        :deadline,
+        keyword_init: true
+      )
 
       private_constant :TransientError, :RESOLUTION_MEMO_TTL_SECONDS, :RESOLUTION_MEMO_LIMIT,
-                       :ResolutionMemo, :ResolutionFlight
+                       :RESOLUTION_FLIGHT_WAIT_SECONDS, :ResolutionMemo,
+                       :ResolutionPublicationLane, :ResolutionFlight
 
       attr_reader :cache_dir, :endpoint
 
@@ -45,6 +56,7 @@ module Cohere
         @resolution_guard = Mutex.new
         @resolution_memo = {}
         @resolution_flights = {}
+        @resolution_publication_guards = {}
       end
 
       def offline?
@@ -153,34 +165,31 @@ module Cohere
 
       def resolve_online_revision(repo_id, revision)
         key = resolution_key(repo_id, revision)
-        flight = nil
-        @resolution_guard.synchronize do
-          prune_resolution_memo
-          memo = @resolution_memo[key]
-          return resolution_value(memo.value, memo.error) if memo
-
-          flight = @resolution_flights[key]
-          if flight
-            flight.condition.wait(@resolution_guard) until flight.complete
-            return resolution_value(flight.value, flight.error)
-          end
-
-          flight = ResolutionFlight.new(condition: ConditionVariable.new, complete: false)
-          @resolution_flights[key] = flight
-        end
-
-        value = error = nil
+        owned_flight = nil
+        cleanup_completed = false
         begin
-          value = fetch_online_revision(repo_id, revision)
-        rescue Exception => e # rubocop:disable Lint/RescueException -- every exit must release concurrent waiters
-          error = e
-          raise
-        ensure
-          Thread.handle_interrupt(Exception => :never) do
-            complete_resolution(key, flight, value, error)
+          result = loop do
+            role, result = claim_resolution(key) { |flight| owned_flight = flight }
+            case role
+            when :memo
+              break resolution_value(result.value, result.error)
+            when :leader
+              break lead_resolution(key, result, repo_id, revision)
+            when :waiter
+              waited = wait_for_resolution(key, result, repo_id, revision)
+              next if waited.state == :abandoned
+
+              break resolution_value(waited.value, waited.error)
+            else
+              raise "Unknown Hub resolution role: #{role.inspect}"
+            end
           end
+          cleanup_owned_resolution(key, owned_flight)
+          cleanup_completed = true
+          result
+        ensure
+          cleanup_owned_resolution(key, owned_flight) unless cleanup_completed
         end
-        value
       end
 
       def fetch_online_revision(repo_id, revision)
@@ -193,31 +202,231 @@ module Cohere
           raise TransientError, "Hub returned no immutable commit for #{repo_id.inspect} at #{revision.inspect}"
         end
 
-        commit = commit.downcase
-        write_ref(repo_id, revision, commit)
-        commit
+        commit.downcase
       rescue JSON::ParserError => e
         raise TransientError, "Invalid Hub response while resolving #{repo_id.inspect}: #{e.message}"
       end
 
-      def complete_resolution(key, flight, value, error)
+      def claim_resolution(key)
         @resolution_guard.synchronize do
-          if error.nil? || transient_resolution_error?(error)
-            @resolution_memo.delete(key)
-            @resolution_memo[key] = ResolutionMemo.new(
-              value: value,
-              error: error,
-              expires_at: monotonic + RESOLUTION_MEMO_TTL_SECONDS
-            )
-            @resolution_memo.shift while @resolution_memo.length > RESOLUTION_MEMO_LIMIT
-          end
+          prune_resolution_memo
+          memo = @resolution_memo[key]
+          return [:memo, memo] if memo
 
-          flight.value = value
-          flight.error = error
-          flight.complete = true
+          flight = @resolution_flights[key]
+          return [:waiter, flight] if flight
+
+          lane = @resolution_publication_guards[key] || ResolutionPublicationLane.new(
+            mutex: Mutex.new,
+            owners: {}.compare_by_identity
+          )
+          flight = ResolutionFlight.new(
+            condition: ConditionVariable.new,
+            publication_lane: lane,
+            state: :pending,
+            deadline: monotonic + resolution_flight_wait_seconds
+          )
+          # Give the caller ownership before publishing the flight. Its outer
+          # ensure can then retire the entry even if Thread#kill lands between
+          # this registration and the leader's normal completion path.
+          yield flight
+          @resolution_publication_guards[key] = lane
+          lane.owners[flight] = true
+          @resolution_flights[key] = flight
+          [:leader, flight]
+        end
+      end
+
+      def release_resolution_publication(key, flight)
+        @resolution_guard.synchronize do
+          lane = @resolution_publication_guards[key]
+          return unless lane.equal?(flight.publication_lane)
+
+          lane.owners.delete(flight)
+          @resolution_publication_guards.delete(key) if lane.owners.empty?
+        end
+      end
+
+      def retire_owned_resolution(key, flight)
+        @resolution_guard.synchronize do
+          return unless @resolution_flights[key].equal?(flight)
+
+          flight.state = :abandoned
+          flight.value = nil
+          flight.error = nil
           @resolution_flights.delete(key)
           flight.condition.broadcast
         end
+      end
+
+      def cleanup_owned_resolution(key, flight)
+        return unless flight
+
+        completed = false
+        begin
+          retire_owned_resolution(key, flight)
+          release_resolution_publication(key, flight)
+          completed = true
+        ensure
+          unless completed
+            begin
+              retire_owned_resolution(key, flight)
+            ensure
+              release_resolution_publication(key, flight)
+            end
+          end
+        end
+      end
+
+      def lead_resolution(key, flight, repo_id, revision)
+        state = :abandoned
+        value = error = nil
+        begin
+          value = Thread.handle_interrupt(Exception => :immediate) do
+            fetch_online_revision(repo_id, revision)
+          end
+          state = :success
+        rescue StandardError => e
+          state = :error
+          error = e
+          raise
+        ensure
+          completion_error = complete_resolution(
+            key,
+            flight,
+            state,
+            value,
+            error,
+            repo_id,
+            revision
+          )
+        end
+        raise completion_error if completion_error
+
+        value
+      end
+
+      def wait_for_resolution(key, flight, repo_id, revision)
+        @resolution_guard.synchronize do
+          while flight.state == :pending
+            remaining = flight.deadline - monotonic
+            if remaining <= 0
+              expire_resolution(key, flight, repo_id, revision)
+              break
+            end
+
+            flight.condition.wait(@resolution_guard, remaining)
+          end
+          flight
+        end
+      end
+
+      def expire_resolution(key, flight, repo_id, revision)
+        return unless @resolution_flights[key].equal?(flight) && flight.state == :pending
+
+        timeout_error = TransientError.new(
+          "Timed out waiting for another Hub revision request for #{repo_id.inspect} at #{revision.inspect}"
+        )
+        completed = false
+        begin
+          flight.state = :expired
+          flight.error = timeout_error
+          @resolution_flights.delete(key)
+          flight.condition.broadcast
+          completed = true
+        ensure
+          unless completed
+            flight.state = :expired
+            flight.value = nil
+            flight.error = timeout_error
+            @resolution_flights.delete(key) if @resolution_flights[key].equal?(flight)
+            flight.condition.broadcast
+          end
+        end
+      end
+
+      def complete_resolution(key, flight, state, value, error, repo_id, revision)
+        completion_error = nil
+        abnormal_error = nil
+        if state == :success
+          flight.publication_lane.mutex.synchronize do
+            if authoritative_resolution?(key, flight)
+              begin
+                # The per-reference guard keeps an expired late writer ahead of
+                # its successor without blocking flight deadlines or other refs.
+                write_ref(repo_id, revision, value)
+              rescue StandardError => e
+                state = :error
+                error = completion_error = e
+              rescue Exception => e # rubocop:disable Lint/RescueException -- abandon before propagating
+                state = :abandoned
+                abnormal_error = e
+              end
+            end
+          end
+        end
+        finalize_resolution(key, flight, state, value, error)
+        raise abnormal_error if abnormal_error
+
+        completion_error
+      end
+
+      def authoritative_resolution?(key, flight)
+        @resolution_guard.synchronize do
+          @resolution_flights[key].equal?(flight) && flight.state == :pending
+        end
+      end
+
+      def finalize_resolution(key, flight, state, value, error)
+        completed = false
+        begin
+          @resolution_guard.synchronize do
+            authoritative = false
+            final_state = :abandoned
+            final_value = final_error = nil
+            begin
+              if @resolution_flights[key].equal?(flight)
+                authoritative = true
+                final_state = state
+                final_value = value
+                final_error = error
+                memoizable = state == :success || (state == :error && transient_resolution_error?(error))
+                memoize_resolution(key, value, error) if memoizable
+              end
+            ensure
+              if authoritative
+                flight.state = final_state
+                flight.value = final_value
+                flight.error = final_error
+                @resolution_flights.delete(key) if @resolution_flights[key].equal?(flight)
+                flight.condition.broadcast
+              end
+            end
+          end
+          completed = true
+        ensure
+          repair_resolution_finalization(key, flight) unless completed
+        end
+      end
+
+      def repair_resolution_finalization(key, flight)
+        @resolution_guard.synchronize do
+          flight.state = :abandoned
+          flight.value = nil
+          flight.error = nil
+          @resolution_flights.delete(key) if @resolution_flights[key].equal?(flight)
+          flight.condition.broadcast
+        end
+      end
+
+      def memoize_resolution(key, value, error)
+        @resolution_memo.delete(key)
+        @resolution_memo[key] = ResolutionMemo.new(
+          value: value,
+          error: error,
+          expires_at: monotonic + RESOLUTION_MEMO_TTL_SECONDS
+        )
+        @resolution_memo.shift while @resolution_memo.length > RESOLUTION_MEMO_LIMIT
       end
 
       def resolution_value(value, error)
@@ -241,6 +450,10 @@ module Cohere
 
       def monotonic
         Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      end
+
+      def resolution_flight_wait_seconds
+        RESOLUTION_FLIGHT_WAIT_SECONDS
       end
 
       def request(uri, stream: nil, redirects: 0)

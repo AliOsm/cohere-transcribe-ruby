@@ -181,6 +181,7 @@ module Cohere
           contents = { "txt" => "transcript\n", "json" => "{\"ok\":true}\n" }
           contents.each { |format, content| output_paths.fetch(format).binwrite(content) }
           state_path = State.state_path_for_outputs(output_paths)
+          binding = State::DirectoryBinding.capture(root)
           state_path.binwrite(
             State.published_manifest_content(
               source_snapshot: snapshot,
@@ -197,14 +198,17 @@ module Cohere
             output_paths: output_paths,
             state_path: state_path,
             asr_contract_key: "asr",
-            render_contract_key: "render"
+            render_contract_key: "render",
+            directory_binding: binding,
+            guard_bindings: [binding]
           )
           assert verified.verified?, verified.reason
           assert_equal "generation", verified.generation_id
 
           wrong_render = State.verify_published_outputs(
             source_snapshot: snapshot, output_paths: output_paths, state_path: state_path,
-            asr_contract_key: "asr", render_contract_key: "changed"
+            asr_contract_key: "asr", render_contract_key: "changed",
+            directory_binding: binding, guard_bindings: [binding]
           )
           refute wrong_render.verified?
           assert_match(/render contract/, wrong_render.reason)
@@ -212,7 +216,8 @@ module Cohere
           output_paths.fetch("txt").binwrite("tampered!!\n")
           tampered = State.verify_published_outputs(
             source_snapshot: snapshot, output_paths: output_paths, state_path: state_path,
-            asr_contract_key: "asr", render_contract_key: "render"
+            asr_contract_key: "asr", render_contract_key: "render",
+            directory_binding: binding, guard_bindings: [binding]
           )
           refute tampered.verified?
           assert_match(/does not match/, tampered.reason)
@@ -827,35 +832,69 @@ module Cohere
         end
       end
 
-      def test_lock_registry_uses_the_configured_and_default_cache_roots
+      def test_output_lock_identity_is_output_adjacent_and_independent_of_cache_environment
         Dir.mktmpdir("cohere-lock-cache-paths") do |directory|
           root = Pathname(directory)
-          custom_cache = root.join("custom-cache")
-          with_lock_cache_environment("COHERE_TRANSCRIBE_CACHE" => custom_cache.to_s) do
-            assert_equal custom_cache.join("locks"), State.lock_registry_directory
+          output_parent = root.join("outputs")
+          output_parent.mkdir
+          outputs = { "txt" => output_parent.join("clip.txt") }
+          targets = []
+
+          with_lock_cache_environment("COHERE_TRANSCRIBE_CACHE" => root.join("custom-cache").to_s) do
+            targets << State.lock_target_for_outputs(outputs)
+          end
+          with_lock_cache_environment("XDG_CACHE_HOME" => root.join("xdg-cache").to_s) do
+            targets << State.lock_target_for_outputs(outputs)
+          end
+          with_lock_cache_environment("XDG_CACHE_HOME" => "", "HOME" => root.join("home").to_s) do
+            targets << State.lock_target_for_outputs(outputs)
+          end
+          with_lock_cache_environment("XDG_CACHE_HOME" => "", "HOME" => "") do
+            target = State.lock_target_for_outputs(outputs)
+            targets << target
+            assert State.lock_paths_for_target(target).all?(&:absolute?)
+            State.with_output_lock(target) { nil }
+          end
+          unusable_home = root.join("home-is-a-file")
+          unusable_home.binwrite("not a directory")
+          with_lock_cache_environment("HOME" => unusable_home.to_s) do
+            target = State.lock_target_for_outputs(outputs)
+            targets << target
+            State.with_output_lock(target) { nil }
+          end
+          first_cwd = root.join("first-cwd")
+          second_cwd = root.join("second-cwd")
+          first_cwd.mkdir
+          second_cwd.mkdir
+          [first_cwd, second_cwd].each do |cwd|
+            Dir.chdir(cwd) do
+              with_lock_cache_environment(
+                "COHERE_TRANSCRIBE_CACHE" => "relative-cache",
+                "HOME" => root.join("home").to_s
+              ) do
+                target = State.lock_target_for_outputs(outputs)
+                targets << target
+                assert State.lock_paths_for_target(target).all?(&:absolute?)
+              end
+            end
           end
 
-          xdg_cache = root.join("xdg-cache")
-          with_lock_cache_environment("XDG_CACHE_HOME" => xdg_cache.to_s) do
-            assert_equal xdg_cache.join("cohere-transcribe/locks"), State.lock_registry_directory
-          end
-
-          home = root.join("home")
-          with_lock_cache_environment("HOME" => home.to_s) do
-            assert_equal home.join(".cache/cohere-transcribe/locks"), State.lock_registry_directory
-          end
+          assert_equal 1, targets.map(&:path).uniq.length
+          assert_equal output_parent.join(".cohere-transcribe-locks"), targets.first.path.dirname
         end
       end
 
-      def test_output_lock_creates_a_nested_private_cache_registry
+      def test_output_lock_creates_an_output_adjacent_registry_with_expected_mode
         Dir.mktmpdir("cohere-lock-nested-cache") do |directory|
-          cache = Pathname(directory).join("nested/cache/cohere")
-          with_lock_cache_environment("COHERE_TRANSCRIBE_CACHE" => cache.to_s) do
+          root = Pathname(directory)
+          output_parent = root.join("nested/outputs")
+          FileUtils.mkdir_p(output_parent)
+          with_lock_cache_environment("HOME" => root.join("home").to_s) do
             target = State.lock_target_for_outputs(
-              "txt" => Pathname(directory).join("outputs/clip.txt")
+              "txt" => output_parent.join("clip.txt")
             )
-            assert_equal cache.join("locks"), target.path.dirname
-            refute cache.exist?
+            assert_equal output_parent.join(".cohere-transcribe-locks"), target.path.dirname
+            refute target.path.dirname.exist?
 
             lock = State::OutputSetLock.acquire(target)
             begin
@@ -867,6 +906,195 @@ module Cohere
             end
             assert_equal 0, run_lock_child(target)
           end
+        end
+      end
+
+      def test_output_lock_contends_with_the_released_previous_registry_location
+        Dir.mktmpdir("cohere-lock-compatibility") do |directory|
+          root = Pathname(directory)
+          output_parent = root.join("outputs")
+          output_parent.mkdir
+          with_lock_cache_environment("XDG_CACHE_HOME" => root.join("cache").to_s) do
+            target = State.lock_target_for_outputs("txt" => output_parent.join("clip.txt"))
+            legacy_paths = State.lock_paths_for_target(target).drop(1)
+            assert_equal [State.legacy_temporary_lock_path(target.identity)], legacy_paths
+
+            legacy_paths.each do |path|
+              legacy_target = State::OutputLockTarget.new(path: path, identity: target.identity)
+              lock = State::OutputSetLock.acquire(legacy_target)
+              begin
+                assert_equal 23, run_lock_child(target)
+              ensure
+                lock.release
+              end
+              assert_equal 0, run_lock_child(target)
+
+              lock = State::OutputSetLock.acquire(target)
+              begin
+                assert_equal 23, run_lock_child(legacy_target)
+              ensure
+                lock.release
+              end
+              assert_equal 0, run_lock_child(legacy_target)
+            end
+          end
+        end
+      end
+
+      def test_output_lock_release_attempts_every_handle_and_preserves_the_first_failure
+        events = []
+        first_failure = Errno::EIO.new("unlock failed")
+        later_failure = Errno::EPERM.new("close failed")
+        handles = [
+          fake_lock_handle("first", events, close_error: later_failure),
+          fake_lock_handle("second", events, unlock_error: first_failure)
+        ]
+        keys = %w[first second]
+        target = State::OutputLockTarget.new(path: Pathname("/unused"), identity: "test output")
+        lock = State::OutputSetLock.new(target, handles, keys)
+        State::OutputSetLock.guard.synchronize do
+          keys.each { |key| State::OutputSetLock.active[key] = lock }
+        end
+
+        error = assert_raises(Errno::EIO) { lock.release }
+
+        assert_same first_failure, error
+        assert_equal [
+          ["second", :unlock], ["second", :close],
+          ["first", :unlock], ["first", :close]
+        ], events
+        assert lock.released?
+        assert_empty State::OutputSetLock.active
+        lock.release
+      ensure
+        State::OutputSetLock.guard.synchronize do
+          keys&.each { |key| State::OutputSetLock.active.delete(key) }
+        end
+      end
+
+      def test_output_lock_acquisition_preserves_its_failure_when_cleanup_also_fails
+        original_open_lock_file = State.method(:open_lock_file)
+        events = []
+        cleanup_failure = Errno::EIO.new("unlock failed")
+        handle = fake_lock_handle("candidate", events, unlock_error: cleanup_failure)
+        State.define_singleton_method(:open_lock_file) { |_path| handle }
+        primary_failure = Class.new(StandardError)
+        target = State::OutputLockTarget.new(path: Pathname("/unused/custom.lock"), identity: "test output")
+
+        error = assert_raises(primary_failure) do
+          State::OutputSetLock.acquire(
+            target,
+            operation_hook: ->(*) { raise primary_failure, "acquisition failed" }
+          )
+        end
+
+        assert_equal "acquisition failed", error.message
+        assert_equal [["candidate", :lock], ["candidate", :unlock], ["candidate", :close]], events
+        assert_empty State::OutputSetLock.active
+      ensure
+        State.define_singleton_method(:open_lock_file, original_open_lock_file) if original_open_lock_file
+      end
+
+      def test_output_lock_registration_failure_removes_every_key_and_unlocks_every_path
+        Dir.mktmpdir("cohere-lock-registration-failure") do |directory|
+          target = State.lock_target_for_outputs(
+            "txt" => Pathname(directory).join("clip.txt")
+          )
+          failure = Class.new(StandardError)
+
+          assert_raises(failure) do
+            State::OutputSetLock.acquire(
+              target,
+              ownership_hook: ->(*) { raise failure, "registration failed" }
+            )
+          end
+
+          assert_empty State::OutputSetLock.active
+          assert_equal 0, run_lock_child(target)
+        end
+      end
+
+      def test_killing_with_output_lock_caller_after_registration_releases_every_path
+        Dir.mktmpdir("cohere-lock-caller-kill") do |directory|
+          target = State.lock_target_for_outputs(
+            "txt" => Pathname(directory).join("clip.txt")
+          )
+          source_path = State::OutputSetLock.method(:acquire).source_location.fetch(0)
+          handoff_line = File.readlines(source_path).index { |line| line.match?(/^\s+lock\s*$/) } + 1
+          reached = Queue.new
+          entered = false
+          trace = TracePoint.new(:line) do |event|
+            next unless event.path == source_path && event.lineno == handoff_line
+
+            reached << true
+            sleep
+          end
+          caller = Thread.new do
+            trace.enable(target_thread: Thread.current) do
+              State.with_output_lock(target) { entered = true }
+            end
+          end
+          caller.report_on_exception = false
+
+          Timeout.timeout(2) { reached.pop }
+          caller.kill
+
+          assert caller.join(2), "lock caller remained stuck during teardown"
+          assert_nil caller.value
+          refute entered
+          assert_empty State::OutputSetLock.active
+          assert_equal 0, run_lock_child(target)
+        ensure
+          trace&.disable
+          caller&.kill
+          caller&.join
+        end
+      end
+
+      def test_with_output_lock_preserves_the_protected_failure_when_release_also_fails
+        original_acquire = State::OutputSetLock.method(:acquire)
+        release_failure = Errno::EIO.new("release failed")
+        release_calls = 0
+        fake_lock = Object.new
+        fake_lock.define_singleton_method(:release) do
+          release_calls += 1
+          raise release_failure
+        end
+        State::OutputSetLock.define_singleton_method(:acquire) do |_target, **keywords|
+          keywords.fetch(:ownership_hook).call(fake_lock)
+          fake_lock
+        end
+        target = State::OutputLockTarget.new(path: Pathname("/unused/custom.lock"), identity: "test output")
+        primary_failure = Class.new(StandardError).new("protected work failed")
+
+        error = assert_raises(primary_failure.class) do
+          State.with_output_lock(target) { raise primary_failure }
+        end
+
+        assert_same primary_failure, error
+        assert_equal 1, release_calls
+        cleanup_error = assert_raises(Errno::EIO) { State.with_output_lock(target) { :completed } }
+        assert_same release_failure, cleanup_error
+        assert_equal 2, release_calls
+      ensure
+        State::OutputSetLock.define_singleton_method(:acquire, original_acquire) if original_acquire
+      end
+
+      def test_output_lock_contends_across_different_cache_environments
+        Dir.mktmpdir("cohere-lock-cache-environments") do |directory|
+          root = Pathname(directory)
+          output_parent = root.join("outputs")
+          output_parent.mkdir
+          target = with_lock_cache_environment("XDG_CACHE_HOME" => root.join("cache-a").to_s) do
+            State.lock_target_for_outputs("txt" => output_parent.join("clip.txt"))
+          end
+          lock = State::OutputSetLock.acquire(target)
+          begin
+            assert_equal 23, run_lock_child(target, "XDG_CACHE_HOME" => root.join("cache-b").to_s)
+          ensure
+            lock.release
+          end
+          assert_equal 0, run_lock_child(target, "XDG_CACHE_HOME" => root.join("cache-b").to_s)
         end
       end
 
@@ -1013,9 +1241,10 @@ module Cohere
 
         Dir.mktmpdir do |directory|
           before = Pathname("/proc/self/fd").children.length
+          root = Pathname(directory)
           1_500.times do |index|
             target = State.lock_target_for_outputs(
-              "txt" => Pathname(directory).join("directory-#{index}", "clip.txt")
+              "txt" => root.join("clip-#{index}.txt")
             )
             State.with_output_lock(target) { nil }
           end
@@ -1035,6 +1264,26 @@ module Cohere
       ensure
         previous&.each do |name, value|
           value.nil? ? ENV.delete(name) : ENV[name] = value
+        end
+      end
+
+      def fake_lock_handle(name, events, unlock_error: nil, close_error: nil)
+        closed = false
+        Object.new.tap do |handle|
+          handle.define_singleton_method(:closed?) { closed }
+          handle.define_singleton_method(:flock) do |operation|
+            events << [name, operation == File::LOCK_UN ? :unlock : :lock]
+            raise unlock_error if operation == File::LOCK_UN && unlock_error
+
+            true
+          end
+          handle.define_singleton_method(:close) do
+            events << [name, :close]
+            closed = true
+            raise close_error if close_error
+
+            nil
+          end
         end
       end
 
@@ -1109,7 +1358,7 @@ module Cohere
         )
       end
 
-      def run_lock_child(target)
+      def run_lock_child(target, environment = {})
         script = <<~RUBY
           require "cohere/transcribe"
           target = Cohere::Transcribe::State::OutputLockTarget.new(
@@ -1124,6 +1373,7 @@ module Cohere
         RUBY
         library = Pathname(__dir__).join("../../lib").expand_path
         _stdout, _stderr, status = Open3.capture3(
+          environment,
           RbConfig.ruby, "-I#{library}", "-e", script, target.path.to_s, target.identity
         )
         status.exitstatus

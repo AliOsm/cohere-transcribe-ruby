@@ -2,12 +2,13 @@
 
 require "digest"
 require "fileutils"
+require "tmpdir"
 
 module Cohere
   module Transcribe
     module State
       LOCK_DIRECTORY_PREFIX = "cohere-transcribe"
-      LOCK_DIRECTORY_NAME = "locks"
+      LOCK_DIRECTORY_NAME = ".cohere-transcribe-locks"
       LOCK_SUFFIX = ".lock"
 
       OutputLockTarget = Data.define(:path, :identity) do
@@ -23,73 +24,127 @@ module Cohere
         class << self
           attr_reader :guard, :active
 
-          def acquire(target, blocking: false, operation_hook: nil)
+          def acquire(target, blocking: false, operation_hook: nil, ownership_hook: nil)
             guard.synchronize do
-              handle = nil
+              handles = []
+              registered_keys = []
               acquired = false
-              key = target.path.to_s
-              if active.key?(key)
+              lock = nil
+              paths = State.lock_paths_for_target(target)
+              keys = paths.map(&:to_s)
+              if keys.any? { |key| active.key?(key) }
                 raise TranscriptionRuntimeError,
                       "Another transcription job owns output set #{target.identity}"
               end
 
-              handle = State.open_lock_file(target.path)
-              operation = File::LOCK_EX
-              operation |= File::LOCK_NB unless blocking
-              unless handle.flock(operation)
-                handle.close
-                raise TranscriptionRuntimeError,
-                      "Another transcription process owns output set #{target.identity} (lock #{target.path})"
+              paths.each_with_index do |path, index|
+                handle = State.open_lock_file(path)
+                handles << handle
+                operation = File::LOCK_EX
+                operation |= File::LOCK_NB unless blocking
+                unless handle.flock(operation)
+                  raise TranscriptionRuntimeError,
+                        "Another transcription process owns output set #{target.identity} (lock #{path})"
+                end
+                operation_hook&.call(:after_flock, target) if index.zero?
+                State.verify_lock_identity!(
+                  path,
+                  handle,
+                  message: "Output lock changed while acquiring #{target.identity}"
+                )
               end
-              operation_hook&.call(:after_flock, target)
-              State.verify_lock_identity!(
-                target.path,
-                handle,
-                message: "Output lock changed while acquiring #{target.identity}"
-              )
 
-              lock = new(target, handle, key)
-              active[key] = lock
+              lock = new(target, handles, keys)
+              keys.each do |key|
+                registered_keys << key
+                active[key] = lock
+              end
+              ownership_hook&.call(lock)
               acquired = true
               lock
             rescue Errno::EWOULDBLOCK, Errno::EAGAIN
-              handle&.close
               raise TranscriptionRuntimeError,
-                    "Another transcription process owns output set #{target.identity} (lock #{target.path})"
-            rescue Interrupt, SystemExit, StandardError
-              handle&.close
-              raise
+                    "Another transcription process owns output set #{target.identity}"
             ensure
-              handle.close if handle && !acquired && !handle.closed?
+              primary_error = $! # rubocop:disable Style/SpecialGlobalVars
+              unless acquired && primary_error.nil?
+                cleanup_error = nil
+                Thread.handle_interrupt(Exception => :never) do
+                  registration_error = delete_active_keys(lock, registered_keys || [])
+                  handle_error = close_lock_handles(handles || [])
+                  cleanup_error = registration_error || handle_error
+                end
+                raise cleanup_error if cleanup_error && primary_error.nil?
+              end
             end
           end
 
           def release_all
-            guard.synchronize { active.values.dup }.each(&:release)
+            guard.synchronize { active.values.uniq }.each(&:release)
+          end
+
+          def close_lock_handles(handles)
+            first_error = nil
+            Thread.handle_interrupt(Exception => :never) do
+              handles.reverse_each do |handle|
+                begin
+                  next if handle.closed?
+                rescue Exception => e # rubocop:disable Lint/RescueException
+                  first_error ||= e
+                end
+
+                begin
+                  handle.flock(File::LOCK_UN)
+                rescue Exception => e # rubocop:disable Lint/RescueException
+                  first_error ||= e
+                end
+                begin
+                  handle.close
+                rescue Exception => e # rubocop:disable Lint/RescueException
+                  first_error ||= e
+                end
+              end
+            end
+            first_error
+          end
+
+          def delete_active_keys(lock, keys)
+            first_error = nil
+            keys.reverse_each do |key|
+              active.delete(key) if active[key].equal?(lock)
+            rescue Exception => e # rubocop:disable Lint/RescueException
+              first_error ||= e
+            end
+            first_error
           end
         end
 
         attr_reader :target
 
-        def initialize(target, handle, key)
+        def initialize(target, handles, keys)
           @target = target
-          @handle = handle
-          @key = key
+          @handles = handles
+          @keys = keys
           @released = false
         end
 
         def release
-          self.class.guard.synchronize do
-            return if @released
+          cleanup_error = nil
+          Thread.handle_interrupt(Exception => :never) do
+            self.class.guard.synchronize do
+              return if @released
 
-            begin
-              @handle.flock(File::LOCK_UN)
-            ensure
-              @handle.close
-              @released = true
-              self.class.active.delete(@key)
+              begin
+                handle_error = self.class.close_lock_handles(@handles)
+                registration_error = self.class.delete_active_keys(self, @keys)
+                cleanup_error = handle_error || registration_error
+              ensure
+                @released = true
+              end
             end
           end
+          raise cleanup_error if cleanup_error
+
           nil
         end
 
@@ -103,24 +158,59 @@ module Cohere
       def lock_target_for_outputs(output_paths)
         parent, stem = output_parent_and_stem(output_paths)
         identity = parent.join(stem).expand_path.cleanpath.to_s
-        digest = Digest::SHA256.hexdigest(identity.downcase)
         OutputLockTarget.new(
-          path: lock_registry_directory.join("#{digest}#{LOCK_SUFFIX}").freeze,
+          path: canonical_lock_path(identity).freeze,
           identity: identity.freeze
         )
       end
 
       def with_output_lock(target, blocking: false)
-        lock = OutputSetLock.acquire(target, blocking: blocking)
-        yield lock
-      ensure
-        lock&.release
+        lock = nil
+        completed = false
+        Thread.handle_interrupt(Exception => :never) do
+          Thread.handle_interrupt(Exception => :on_blocking) do
+            OutputSetLock.acquire(
+              target,
+              blocking: blocking,
+              ownership_hook: ->(acquired_lock) { lock = acquired_lock }
+            )
+          end
+          result = Thread.handle_interrupt(Exception => :immediate) { yield lock }
+          completed = true
+          result
+        ensure
+          begin
+            lock&.release
+          rescue Exception # rubocop:disable Lint/RescueException
+            raise if completed
+          end
+        end
       end
 
-      def lock_registry_directory
-        cache_root = ENV["COHERE_TRANSCRIBE_CACHE"] ||
-                     File.join(ENV.fetch("XDG_CACHE_HOME", File.expand_path("~/.cache")), LOCK_DIRECTORY_PREFIX)
-        Pathname(cache_root).expand_path.join(LOCK_DIRECTORY_NAME)
+      def lock_paths_for_target(target)
+        primary = Pathname(target.path).expand_path.cleanpath
+        return [primary].freeze unless primary == canonical_lock_path(target.identity)
+
+        compatibility = [legacy_temporary_lock_path(target.identity)]
+        ([primary] + compatibility.reject { |path| path == primary }).freeze
+      end
+
+      def canonical_lock_path(identity)
+        identity = Pathname(identity).expand_path.cleanpath
+        lock_registry_directory(identity.dirname).join(lock_filename(identity.to_s))
+      end
+
+      def lock_registry_directory(output_parent)
+        Pathname(output_parent).expand_path.cleanpath.join(LOCK_DIRECTORY_NAME)
+      end
+
+      def legacy_temporary_lock_path(identity)
+        scope = Process.respond_to?(:uid) ? Process.uid.to_s : Digest::SHA256.hexdigest(Dir.home)[0, 16]
+        Pathname(Dir.tmpdir).expand_path.join("#{LOCK_DIRECTORY_PREFIX}-#{scope}", lock_filename(identity))
+      end
+
+      def lock_filename(identity)
+        "#{Digest::SHA256.hexdigest(identity.downcase)}#{LOCK_SUFFIX}"
       end
 
       def open_lock_file(path)

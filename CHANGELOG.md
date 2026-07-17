@@ -1,13 +1,13 @@
 # Changelog
 
-## [0.1.3] - 2026-07-16
+## [0.1.3] - 2026-07-17
 
-- Close every libsndfile handle and native session exactly once, preserve caller interruption through FFmpeg cancellation cleanup, reject empty native inference rows locally, and consolidate detached session ownership without retaining wrapper objects.
-- Match native FFmpeg mono mixing for common multichannel layouts, classify decoded-audio ceiling failures explicitly, prepare unknown sizes concurrently, retry missing or low estimates sequentially with the full ceiling, and limit metadata probing to the current and next groups.
-- Restore warm-cache Hub operation for temporary connection, rate-limit, server, and malformed-response failures while retaining online branch revalidation, short request coalescing, and definitive authentication or missing-repository errors.
-- Reject invalid byte paths before transcription or publication, treat publication-parent changes during read-only verification as reprocessing decisions, reject inverted segment bounds, and keep cross-process output locks in the stable per-user cache.
+- Close every libsndfile handle and native session exactly once, cancel and join dedicated native workers even when their owning Ruby thread is terminated, reject empty native inference rows locally, and consolidate detached session ownership without retaining wrapper objects.
+- Match native FFmpeg mono mixing for common multichannel layouts, classify decoded-audio ceiling failures explicitly, prepare unknown sizes concurrently, retain successful grouped decodes across ceiling retries when memory permits, and keep lazy metadata probes on the caller's native stack.
+- Restore warm-cache Hub operation for temporary connection, rate-limit, server, and malformed-response failures while retaining online branch revalidation, bounded request coalescing, abandoned-leader recovery, late-result isolation, and definitive authentication or missing-repository errors.
+- Reject invalid byte paths before transcription or publication, share byte-to-UTF-8 normalization across public surfaces, treat publication-parent changes during read-only verification as reprocessing decisions, reject inverted segment bounds, and coordinate output publication through output-adjacent locks while retaining the released 0.1.2 lock during transition.
 - Combine full-storage tensor checksum validation with conversion, simplify ZIP64 locator and checksum bookkeeping, preserve the discovered CUDA toolkit runtime path, and exclude untracked native build artifacts from locally built gems.
-- Match the pinned Python word-aligner geometry for sub-30-second audio, require exact command-line enum values, and make the public `OUTPUT_FORMATS` constant directly usable with `PublicationOptions`.
+- Match the pinned Python word-aligner geometry for sub-30-second audio, require exact command-line enum values, and use the public `OUTPUT_FORMATS` constant as the single accepted-format source for types and the CLI.
 
 ## [0.1.2] - 2026-07-16
 

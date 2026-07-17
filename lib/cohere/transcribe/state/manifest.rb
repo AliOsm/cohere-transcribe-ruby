@@ -52,8 +52,7 @@ module Cohere
       end
 
       def verify_published_outputs(source_snapshot:, output_paths:, state_path:, asr_contract_key:,
-                                   render_contract_key:, directory_binding: nil,
-                                   guard_bindings: nil)
+                                   render_contract_key:, directory_binding:, guard_bindings: nil)
         payload, reason = decode_state(
           state_path,
           directory_binding: directory_binding,
@@ -93,8 +92,7 @@ module Cohere
       end
 
       def publication_mismatch_reason(payload, source_snapshot:, output_paths:, asr_contract_key:,
-                                      render_contract_key:, directory_binding: nil,
-                                      guard_bindings: nil)
+                                      render_contract_key:, directory_binding:, guard_bindings: nil)
         return "state is #{payload["kind"].inspect}, not published" unless payload["kind"] == "published"
         return "state marker ASR contract does not match" unless payload["asr_contract_key"] == asr_contract_key
         return "state marker render contract does not match" unless payload["render_contract_key"] == render_contract_key
@@ -112,18 +110,11 @@ module Cohere
           return "state marker path for #{format} does not match" unless record.is_a?(Hash) && record["name"] == path.basename.to_s
 
           begin
-            output_record = if directory_binding
-                              bound_output_record(
-                                path,
-                                directory_binding: directory_binding,
-                                guard_bindings: guard_bindings
-                              )
-                            else
-                              stat = path.lstat
-                              return "#{format} output is missing or not regular" unless stat.file? && !stat.symlink?
-
-                              [stat.size, Digest::SHA256.file(path).hexdigest]
-                            end
+            output_record = bound_output_record(
+              path,
+              directory_binding: directory_binding,
+              guard_bindings: guard_bindings
+            )
             return "#{format} output changed or is not regular" unless output_record
 
             size, sha256 = output_record

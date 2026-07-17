@@ -32,16 +32,85 @@ module Cohere
         # A pipelined group receives at most half of the configured decoded-PCM
         # budget (and never more than 512 MiB). Estimated decode sizes determine
         # group membership and per-file ceilings. Unknown sizes receive an equal
-        # share initially; a ceiling failure releases the group and retries each
-        # file alone with the full configured ceiling. A known file that cannot
-        # fit the group cap starts with that exclusive full-budget path.
+        # share initially. A ceiling failure first retries within the remaining
+        # configured PCM budget while successful group entries stay retained. If
+        # that is insufficient, later retained audio is released and only those
+        # entries are prepared again after the full-ceiling retry. A known file
+        # that cannot fit the group cap starts with that exclusive path.
         # Native decoder implementation transients are outside this retained-PCM
         # accounting, as they are in the Python path.
         class Pipeline
           include Enumerable
 
           Group = Data.define(:items, :limits, :exclusive)
-          private_constant :Group
+
+          # Explicit cursor keeps metadata probes on the preparation caller's
+          # native stack while preserving lazy current/next-group discovery.
+          class GroupCursor
+            def initialize(items:, workers:, group_byte_limit:, memory_byte_limit:,
+                           estimated_reservation:, unknown_reservation:, bounded_group:)
+              @items = items
+              @workers = workers
+              @group_byte_limit = group_byte_limit
+              @memory_byte_limit = memory_byte_limit
+              @estimated_reservation = estimated_reservation
+              @unknown_reservation = unknown_reservation
+              @bounded_group = bounded_group
+              @index = 0
+              @pending = nil
+            end
+
+            def next
+              items = []
+              estimates = []
+              total = 0
+              while items.length < @workers
+                pair = take
+                break unless pair
+
+                item, estimate = pair
+                if estimate > @group_byte_limit
+                  if items.empty?
+                    return Group.new(
+                      items: [item].freeze,
+                      limits: [@memory_byte_limit].freeze,
+                      exclusive: true
+                    )
+                  end
+                  @pending = pair
+                  break
+                end
+                if !items.empty? && total + estimate > @group_byte_limit
+                  @pending = pair
+                  break
+                end
+
+                items << item
+                estimates << estimate
+                total += estimate
+              end
+              raise StopIteration if items.empty?
+
+              @bounded_group.call(items, estimates)
+            end
+
+            private
+
+            def take
+              if @pending
+                pair = @pending
+                @pending = nil
+                return pair
+              end
+              return if @index >= @items.length
+
+              item = @items.fetch(@index)
+              @index += 1
+              estimate = @estimated_reservation.call(item) || @unknown_reservation
+              [item, estimate]
+            end
+          end
+          private_constant :Group, :GroupCursor
 
           class WorkerPool
             STOP = Object.new.freeze
@@ -96,7 +165,7 @@ module Cohere
           attr_reader :effective_workers, :group_byte_limit, :memory_byte_limit, :wait_seconds
 
           def initialize(items, memory_byte_limit:, requested_workers:, enabled:, worker_limit: nil,
-                         estimate_bytes: nil, exclusive_retry: nil, &prepare)
+                         estimate_bytes: nil, exclusive_retry: nil, retained_bytes: nil, &prepare)
             raise ArgumentError, "prepare block is required" unless prepare
 
             @items = items.to_a.freeze
@@ -106,6 +175,7 @@ module Cohere
             @prepare = prepare
             @estimate_bytes = estimate_bytes
             @exclusive_retry = exclusive_retry
+            @retained_bytes = retained_bytes
             @wait_seconds = 0.0
             @enabled = enabled && @items.length > 1
             @worker_limit = worker_limit.nil? ? nil : Integer(worker_limit)
@@ -142,8 +212,7 @@ module Cohere
               pending = nil
               next_group = next_group(groups)
               if retry_exclusively?(group, prepared)
-                release(prepared)
-                consume_exclusive_retry(group, pool, &block)
+                consume_with_exclusive_retry(group, prepared, pool, &block)
               else
                 pending = submit(next_group, group_index + 1, pool) if next_group && !group.exclusive && !next_group.exclusive
                 consume(prepared, &block)
@@ -213,55 +282,110 @@ module Cohere
             prepared.any? { |entry| @exclusive_retry.call(entry) }
           end
 
-          def consume_exclusive_retry(group, pool)
-            group.items.each do |item|
-              retry_group = Group.new(
-                items: [item].freeze,
-                limits: [@memory_byte_limit].freeze,
-                exclusive: true
-              )
-              retained = pool.prepare(retry_group)
-              begin
-                yield retained.fetch(0)
-              ensure
-                retained.clear
+          def consume_with_exclusive_retry(group, prepared, pool, &block)
+            released = Array.new(prepared.length, false)
+            prepared.each_index do |index|
+              entry = prepared.fetch(index)
+              if entry.nil? && released.fetch(index)
+                consume_single_retry(group.items.fetch(index), @memory_byte_limit, pool, &block)
+                next
+              end
+              unless @exclusive_retry.call(entry)
+                begin
+                  block.call(entry)
+                ensure
+                  prepared[index] = nil
+                end
+                next
+              end
+
+              prepared[index] = nil
+              collect_released_audio
+              unless @retained_bytes
+                release_retained_entries(prepared, released)
                 collect_released_audio
               end
+              limit = available_retry_limit(prepared)
+              retried = prepare_single(group.items.fetch(index), limit, pool)
+              if limit < @memory_byte_limit && @exclusive_retry.call(retried.fetch(0))
+                retried.clear
+                release_retained_entries(prepared, released)
+                collect_released_audio
+                retried = prepare_single(group.items.fetch(index), @memory_byte_limit, pool)
+              end
+              consume_single_result(retried, &block)
             end
+          ensure
+            release(prepared)
+          end
+
+          def consume_single_retry(item, limit, pool, &)
+            consume_single_result(prepare_single(item, limit, pool), &)
+          end
+
+          def prepare_single(item, limit, pool)
+            pool.prepare(
+              Group.new(
+                items: [item].freeze,
+                limits: [limit].freeze,
+                exclusive: true
+              )
+            )
+          end
+
+          def consume_single_result(retained)
+            yield retained.fetch(0)
+          ensure
+            retained&.clear
+            collect_released_audio
+          end
+
+          def available_retry_limit(prepared)
+            return @memory_byte_limit unless @retained_bytes
+
+            retained = prepared.compact.sum { |entry| retained_bytes(entry) }
+            [@memory_byte_limit - retained, 1].max
+          end
+
+          def release_retained_entries(prepared, released)
+            unless @retained_bytes
+              prepared.each_index do |index|
+                next unless prepared[index]
+
+                prepared[index] = nil
+                released[index] = true
+              end
+              return
+            end
+
+            prepared.each_index do |index|
+              entry = prepared[index]
+              next unless entry && retained_bytes(entry).positive?
+
+              prepared[index] = nil
+              released[index] = true
+            end
+          end
+
+          def retained_bytes(entry)
+            bytes = Integer(@retained_bytes.call(entry))
+            raise ArgumentError, "retained_bytes must return a non-negative integer" if bytes.negative?
+
+            bytes
           end
 
           def build_groups
             return equal_groups.each unless @estimate_bytes
 
-            Enumerator.new do |groups|
-              items = []
-              estimates = []
-              @items.each do |item|
-                if items.length >= @effective_workers
-                  groups << bounded_group(items, estimates)
-                  items = []
-                  estimates = []
-                end
-                estimate = estimated_reservation(item)
-                estimate ||= unknown_reservation
-                if estimate > @group_byte_limit
-                  groups << bounded_group(items, estimates) unless items.empty?
-                  groups << Group.new(items: [item].freeze, limits: [@memory_byte_limit].freeze, exclusive: true)
-                  items = []
-                  estimates = []
-                  next
-                end
-
-                if estimates.sum + estimate > @group_byte_limit
-                  groups << bounded_group(items, estimates)
-                  items = []
-                  estimates = []
-                end
-                items << item
-                estimates << estimate
-              end
-              groups << bounded_group(items, estimates) unless items.empty?
-            end
+            GroupCursor.new(
+              items: @items,
+              workers: @effective_workers,
+              group_byte_limit: @group_byte_limit,
+              memory_byte_limit: @memory_byte_limit,
+              estimated_reservation: method(:estimated_reservation),
+              unknown_reservation: unknown_reservation,
+              bounded_group: method(:bounded_group)
+            )
           end
 
           def equal_groups

@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "optparse"
+require_relative "constants"
 require_relative "errors"
 require_relative "version"
 
@@ -8,8 +9,8 @@ module Cohere
   module Transcribe
     # Command-line adapter for the dependency-light public API.
     module CLI
-      DEFAULT_MODEL_ID = "CohereLabs/cohere-transcribe-arabic-07-2026"
-      OUTPUT_FORMATS = %w[txt srt vtt json].freeze
+      DEFAULT_MODEL_ID = DEFAULT_ASR_MODEL_ID
+      OUTPUT_FORMATS = Cohere::Transcribe::OUTPUT_FORMATS
       OUTPUT_PATH_DISPLAY_LIMIT = 20
       FORMAT_ARGUMENT_SEPARATOR = "\u001F"
       private_constant :FORMAT_ARGUMENT_SEPARATOR

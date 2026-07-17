@@ -533,7 +533,7 @@ module Cohere
 
         # Ruby cannot deliver Thread#raise (including SIGINT's Interrupt) while
         # the receiving thread is blocked inside Fiddle. Keep the caller at an
-        # interruptible join while a private worker owns the foreign call. The
+        # interruptible join while a dedicated worker owns the foreign call. The
         # caller still holds @mutex, so close and another inference cannot race
         # the session; cancellation is the only concurrent C ABI operation.
         def run_native_inference(&)
