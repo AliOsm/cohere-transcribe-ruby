@@ -23,6 +23,7 @@ module Cohere
         class Library
           FUNCTIONS = {
             probe: [%i[voidp size_t], :int],
+            versions: [%i[voidp size_t], :int],
             decode: [%i[voidp int uint64 voidp voidp voidp size_t], :int],
             duration: [%i[voidp voidp voidp size_t], :int],
             cancel: [[], :void],
@@ -40,6 +41,9 @@ module Cohere
           class << self
             def load
               @mutex ||= Mutex.new
+              # A failed load is deliberately retryable. Embedders may set an
+              # adapter override or make a packaged/system library available
+              # after an earlier best-effort audio probe.
               @mutex.synchronize { @instance ||= load_uncached }
             end
 
@@ -89,7 +93,7 @@ module Cohere
             end
           end
 
-          attr_reader :path, :diagnostic, :avutil_major
+          attr_reader :path, :diagnostic, :ffmpeg_versions, :avutil_major
 
           def initialize(path)
             @path = path
@@ -110,11 +114,25 @@ module Cohere
             message[0, ERROR_CAPACITY] = "\0" * ERROR_CAPACITY
             status = @functions.fetch(:probe).call(message, ERROR_CAPACITY)
             @diagnostic = message.to_s.force_encoding(Encoding::UTF_8).scrub.freeze
-            match = @diagnostic.match(/\bavutil\s+(\d+)\b/)
-            @avutil_major = Integer(match[1], 10) if match
-            return self if status.zero?
+            raise TranscriptionRuntimeError, "Native FFmpeg libraries are unavailable: #{@diagnostic}" unless status.zero?
 
-            raise TranscriptionRuntimeError, "Native FFmpeg libraries are unavailable: #{@diagnostic}"
+            tuple_bytes = 4 * Fiddle::SIZEOF_INT
+            tuple = Fiddle::Pointer.malloc(tuple_bytes, Fiddle::RUBY_FREE)
+            tuple[0, tuple_bytes] = [0, 0, 0, 0].pack("i!*")
+            version_status = @functions.fetch(:versions).call(tuple, 4)
+            unless version_status.zero?
+              raise TranscriptionRuntimeError,
+                    "Native FFmpeg libraries did not report their version tuple: #{@diagnostic}"
+            end
+
+            @ffmpeg_versions = tuple[0, tuple_bytes].unpack("i!4").freeze
+            unless @ffmpeg_versions.all?(&:positive?)
+              raise TranscriptionRuntimeError,
+                    "Native FFmpeg libraries reported an invalid version tuple: #{@ffmpeg_versions.inspect}"
+            end
+
+            @avutil_major = @ffmpeg_versions.fetch(2)
+            self
           end
 
           def decode(path, sample_rate:, max_decoded_bytes:)
@@ -250,6 +268,12 @@ module Cohere
 
         def avutil_major
           library.avutil_major
+        rescue TranscriptionRuntimeError
+          nil
+        end
+
+        def ffmpeg_versions
+          library.ffmpeg_versions
         rescue TranscriptionRuntimeError
           nil
         end

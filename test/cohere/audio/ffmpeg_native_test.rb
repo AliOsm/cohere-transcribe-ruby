@@ -15,6 +15,18 @@ module Cohere
 
         def test_probe_and_pcm_decode
           assert_match(/FFmpeg ABI avformat (?:58|59|60|61|62)/, FFmpegNative.diagnostic)
+          format_major, codec_major, util_major, resample_major = FFmpegNative.ffmpeg_versions
+          assert_equal format_major, codec_major
+          assert_equal format_major - 2, util_major
+          assert_equal(util_major, FFmpegNative.avutil_major)
+          expected_resample = if format_major == 58
+                                3
+                              elsif format_major <= 60
+                                4
+                              else
+                                format_major - 56
+                              end
+          assert_equal expected_resample, resample_major
           with_wav(frames: 400) do |path|
             samples = FFmpegNative.decode(
               path,
@@ -287,6 +299,24 @@ module Cohere
               }
             )
           end
+        end
+      end
+
+      class FFmpegNativeLoaderTest < Minitest::Test
+        def test_failed_adapter_load_is_retryable
+          attempts = 0
+          loaded = Object.new
+          loader = Class.new(FFmpegNative::Library)
+          loader.define_singleton_method(:load_uncached) do
+            attempts += 1
+            raise TranscriptionRuntimeError, "adapter unavailable" if attempts == 1
+
+            loaded
+          end
+
+          assert_raises(TranscriptionRuntimeError) { loader.load }
+          assert_same loaded, loader.load
+          assert_equal 2, attempts
         end
       end
     end

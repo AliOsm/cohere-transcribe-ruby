@@ -515,7 +515,8 @@ module Cohere
       end
 
       def write_state_atomic(path, payload, source_snapshot:, directory_binding: nil,
-                             guard_bindings: nil, operation_hook: nil, rename: nil)
+                             guard_bindings: nil, operation_hook: nil, rename: nil,
+                             commit_guard: nil)
         path = Pathname(path).expand_path
         directory_binding ||= ensure_bound_directory(path.dirname)
         with_bound_parent(
@@ -575,6 +576,7 @@ module Cohere
             bound.verify!
             operation_hook&.call(:before_rename, path)
             Thread.handle_interrupt(DEFERRED_PUBLICATION_EXCEPTIONS) do
+              commit_guard&.call
               if rename
                 committed = true
                 rename.call(bound, temporary_name, basename, :commit)
@@ -585,13 +587,14 @@ module Cohere
               operation_hook&.call(:after_rename, path)
               bound.verify!
               bound.fsync
+              commit_guard&.call
             end
             path
           rescue Exception => e # rubocop:disable Lint/RescueException -- rollback includes interrupts
             primary_failed = true
-            if committed
-              begin
-                Thread.handle_interrupt(DEFERRED_PUBLICATION_EXCEPTIONS) do
+            Thread.handle_interrupt(DEFERRED_PUBLICATION_EXCEPTIONS) do
+              if committed
+                begin
                   bound.unlink(basename, missing_ok: true)
                   if backup_name
                     if rename
@@ -601,34 +604,37 @@ module Cohere
                     end
                   end
                   backup_name = nil
+                  bound.fsync
+                rescue SystemCallError, TranscriptionRuntimeError => rollback_error
+                  retained = backup_name ? bound.display_path(backup_name) : nil
+                  preserved_backup = !backup_name.nil?
+                  raise TranscriptionRuntimeError,
+                        "State commit failed and rollback was incomplete (#{rollback_error.message}); " \
+                        "preserved backup: #{retained}",
+                        cause: e
                 end
-                bound.fsync
-              rescue SystemCallError, TranscriptionRuntimeError => rollback_error
-                retained = backup_name ? bound.display_path(backup_name) : nil
-                preserved_backup = !backup_name.nil?
-                raise TranscriptionRuntimeError,
-                      "State commit failed and rollback was incomplete (#{rollback_error.message}); " \
-                      "preserved backup: #{retained}",
-                      cause: e
               end
             end
             raise e
           ensure
-            cleanup_failure = nil
-            cleanup_operations = [
-              -> { temporary&.close unless temporary&.closed? },
-              -> { backup&.close unless backup&.closed? },
-              -> { bound.unlink(temporary_name, missing_ok: true) if temporary_name },
-              lambda do
-                bound.unlink(backup_name, missing_ok: true) if backup_name && !preserved_backup
+            Thread.handle_interrupt(DEFERRED_PUBLICATION_EXCEPTIONS) do
+              cleanup_failure = nil
+              cleanup_operations = [
+                -> { temporary&.close unless temporary&.closed? },
+                -> { backup&.close unless backup&.closed? },
+                -> { bound.unlink(temporary_name, missing_ok: true) if temporary_name },
+                lambda do
+                  bound.unlink(backup_name, missing_ok: true) if backup_name && !preserved_backup
+                end
+              ]
+              cleanup_operations.each do |operation|
+                operation.call
+              rescue SystemCallError, IOError => e
+                cleanup_failure ||= e
               end
-            ]
-            cleanup_operations.each do |operation|
-              operation.call
-            rescue SystemCallError, IOError => e
-              cleanup_failure ||= e
+              raise cleanup_failure if cleanup_failure && !primary_failed &&
+                                       Thread.current.status != "aborting"
             end
-            raise cleanup_failure if cleanup_failure && !primary_failed
           end
         end
       end

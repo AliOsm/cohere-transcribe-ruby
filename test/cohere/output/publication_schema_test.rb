@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "tmpdir"
+require "timeout"
 require "test_helper"
 
 module Cohere
@@ -651,7 +652,7 @@ module Cohere
           end
         end
 
-        def test_thread_kill_after_the_first_rename_finishes_the_output_set_commit
+        def test_thread_kill_between_output_renames_rolls_back_the_output_set
           Dir.mktmpdir do |directory|
             root = Pathname(directory)
             first = root.join("first.txt")
@@ -677,13 +678,101 @@ module Cohere
 
             assert caller.join(2), "output publisher remained stuck after termination"
             assert_nil caller.value
-            assert_equal "first-new", first.binread
-            assert_equal "second-new", second.binread
+            assert_equal "first-old", first.binread
+            assert_equal "second-old", second.binread
             assert_empty(root.children.select { |path| %w[.tmp .bak].include?(path.extname) })
           ensure
             caller&.kill
             caller&.join
           end
+        end
+
+        def test_thread_kill_during_failure_rollback_waits_for_cleanup
+          original_fsync = State::BoundDirectory.instance_method(:fsync)
+          rollback_started = Queue.new
+          continue_rollback = Queue.new
+          block_once = true
+          State::BoundDirectory.define_method(:fsync) do
+            if block_once
+              block_once = false
+              rollback_started << true
+              continue_rollback.pop
+            end
+            original_fsync.bind_call(self)
+          end
+
+          Dir.mktmpdir("cohere-output-rollback-kill") do |directory|
+            root = Pathname(directory)
+            first = root.join("first.txt")
+            second = root.join("second.txt")
+            first.binwrite("first-old")
+            second.binwrite("second-old")
+            caller = Thread.new do
+              Publication.atomic_write_set(
+                { "first" => first, "second" => second },
+                { "first" => "first-new", "second" => "second-new" },
+                operation_hook: lambda do |phase, destination|
+                  raise "force rollback" if phase == :after_rename && destination == first
+                end
+              )
+            end
+            caller.report_on_exception = false
+
+            Timeout.timeout(2) { rollback_started.pop }
+            caller.kill
+            continue_rollback << true
+
+            assert caller.join(2), "output rollback remained stuck after termination"
+            assert_nil caller.value
+            assert_equal "first-old", first.binread
+            assert_equal "second-old", second.binread
+            assert_empty(root.children.select { |path| %w[.tmp .bak].include?(path.extname) })
+          ensure
+            continue_rollback << true if continue_rollback.empty?
+            caller&.kill
+            caller&.join
+          end
+        ensure
+          State::BoundDirectory.define_method(:fsync, original_fsync) if original_fsync
+        end
+
+        def test_cleanup_failure_does_not_replace_thread_kill_after_output_commit
+          original_unlink = State::BoundDirectory.instance_method(:unlink)
+          State::BoundDirectory.define_method(:unlink) do |name, missing_ok: false|
+            raise Errno::EIO, "forced cleanup failure" if name.end_with?(".tmp")
+
+            original_unlink.bind_call(self, name, missing_ok: missing_ok)
+          end
+
+          Dir.mktmpdir("cohere-output-cleanup-termination") do |directory|
+            destination = Pathname(directory).join("output.txt")
+            guard_calls = 0
+            commit_guard = lambda do
+              guard_calls += 1
+              next unless guard_calls == 6
+
+              publishing_thread = Thread.current
+              Thread.new { publishing_thread.kill }.join
+            end
+            caller = Thread.new do
+              Publication.atomic_write_set(
+                { "txt" => destination },
+                { "txt" => "new output" },
+                commit_guard: commit_guard
+              )
+            end
+            caller.report_on_exception = false
+
+            assert caller.join(2), "output publisher remained stuck after termination"
+            assert_nil caller.value
+            assert_equal 6, guard_calls
+            assert_equal "new output", destination.binread
+          ensure
+            caller&.kill
+            caller&.join
+          end
+        ensure
+          State::BoundDirectory.define_method(:unlink, original_unlink) if original_unlink
         end
 
         def test_incomplete_output_rollback_preserves_a_backup_when_its_status_cannot_be_read
@@ -874,6 +963,35 @@ module Cohere
             assert_match(/Source changed while processing/, error.message)
             refute output_root.join("clip.txt").exist?
             refute output_root.join("clip.json").exist?
+            refute plan.state_path.exist?
+          end
+        end
+
+        def test_publication_refuses_to_commit_after_its_output_lock_is_replaced
+          Dir.mktmpdir("cohere-publication-lock-identity") do |directory|
+            root = Pathname(directory)
+            source = root.join("clip.wav")
+            source.binwrite("audio")
+            entry = InputEntry.new(path: source.realpath, relative_path: Pathname("clip.wav"))
+            options = options_with_publication.with(
+              publication: PublicationOptions.new(
+                formats: %w[txt json], output_dir: root.join("out"), existing: "overwrite"
+              )
+            )
+            plan = Publication.plan([entry], options).fetch(source.realpath)
+            completed = result.with(path: source.realpath, relative_path: entry.relative_path)
+
+            error = assert_raises(TranscriptionRuntimeError) do
+              Publication.with_plan_lock(plan) do |lock|
+                parked = plan.lock_target.path.sub_ext(".parked")
+                plan.lock_target.path.rename(parked)
+                plan.lock_target.path.binwrite("")
+                Publication.write(plan, completed, options, lock: lock)
+              end
+            end
+
+            assert_match(/changed while held/, error.message)
+            plan.paths.each_value { |path| refute path.exist? }
             refute plan.state_path.exist?
           end
         end

@@ -10,12 +10,19 @@ module Cohere
       LOCK_DIRECTORY_PREFIX = "cohere-transcribe"
       LOCK_DIRECTORY_NAME = ".cohere-transcribe-locks"
       LOCK_SUFFIX = ".lock"
+      LEGACY_LOCK_REMOVAL_VERSION = "0.2.0"
 
-      OutputLockTarget = Data.define(:path, :identity) do
-        def sort_key
-          [path.to_s.downcase, identity.downcase]
+      OutputLockTarget = Data.define(:path, :identity)
+      LockPath = Data.define(:path, :role) do
+        def canonical?
+          role == :canonical
+        end
+
+        def legacy?
+          role == :legacy
         end
       end
+      private_constant :LockPath
 
       class OutputSetLock
         @guard = Mutex.new
@@ -25,29 +32,30 @@ module Cohere
           attr_reader :guard, :active
 
           def acquire(target, blocking: false, operation_hook: nil, ownership_hook: nil)
+            State.ensure_lock_acquisition_allowed!(target)
             completed = false
             failed = false
             guard.synchronize do
               handles = []
-              registered_keys = []
               lock = nil
-              paths = State.lock_paths_for_target(target)
+              lock_paths = State.lock_path_specs_for_target(target)
+              paths = lock_paths.map(&:path)
               keys = paths.map(&:to_s)
               if keys.any? { |key| active.key?(key) }
                 raise TranscriptionRuntimeError,
                       "Another transcription job owns output set #{target.identity}"
               end
 
-              paths.each_with_index do |path, index|
-                shared = path == State.canonical_lock_path(target.identity)
+              lock_paths.each_with_index do |lock_path, index|
+                path = lock_path.path
                 handle = nil
                 Thread.handle_interrupt(Object => :never) do
-                  handle = State.open_lock_file(path, shared: shared)
+                  handle = State.open_lock_file(path, shared: lock_path.canonical?)
                   handles << handle
                 end
                 operation = File::LOCK_EX
                 operation |= File::LOCK_NB unless blocking
-                unless handle.flock(operation)
+                unless State.acquire_exclusive_file_lock(handle, operation, target: target, path: path)
                   raise TranscriptionRuntimeError,
                         "Another transcription process owns output set #{target.identity} (lock #{path})"
                 end
@@ -57,12 +65,11 @@ module Cohere
                   handle,
                   message: "Output lock changed while acquiring #{target.identity}"
                 )
-                State.refresh_legacy_lock(handle) if path == State.legacy_temporary_lock_path(target.identity)
+                State.refresh_legacy_lock(handle) if lock_path.legacy?
               end
 
               lock = new(target, handles, keys)
               keys.each do |key|
-                registered_keys << key
                 active[key] = lock
               end
               ownership_hook&.call(lock)
@@ -81,10 +88,11 @@ module Cohere
               failed = true
               raise
             ensure
-              unless completed && !failed && Thread.current.status != "aborting"
+              unless completed && !failed && !State.lock_acquisition_unwinding?
                 Thread.handle_interrupt(Object => :never) do
-                  delete_active_keys(lock, registered_keys || [])
+                  delete_active_keys(lock, keys || [])
                   close_lock_handles(handles || [])
+                  lock&.mark_released!
                 end
               end
             end
@@ -134,9 +142,27 @@ module Cohere
 
         def initialize(target, handles, keys)
           @target = target
-          @handles = handles
-          @keys = keys
+          @handles = handles.freeze
+          @keys = keys.freeze
           @released = false
+        end
+
+        def verify!
+          self.class.guard.synchronize do
+            if @released
+              raise TranscriptionRuntimeError,
+                    "Output lock was released before committing #{target.identity}"
+            end
+
+            @keys.zip(@handles).each do |path, handle|
+              State.verify_lock_identity!(
+                path,
+                handle,
+                message: "Output lock changed while held for #{target.identity}"
+              )
+            end
+          end
+          nil
         end
 
         def release
@@ -161,6 +187,10 @@ module Cohere
 
         def released?
           @released
+        end
+
+        def mark_released!
+          @released = true
         end
       end
 
@@ -194,20 +224,30 @@ module Cohere
           begin
             lock&.release
           rescue Exception # rubocop:disable Lint/RescueException -- preserve protected-work failures
-            raise unless primary_error || Thread.current.status == "aborting"
+            raise unless primary_error || lock_acquisition_unwinding?
           end
         end
       end
 
       def lock_paths_for_target(target)
+        lock_path_specs_for_target(target).map(&:path).freeze
+      end
+
+      def lock_path_specs_for_target(target)
         primary = Pathname(target.path).expand_path.cleanpath
-        return [primary].freeze unless primary == canonical_lock_path(target.identity)
+        canonical = canonical_lock_path(target.identity)
+        legacy = legacy_temporary_lock_path(target.identity)
+        unless primary == canonical
+          role = primary == legacy ? :legacy : :custom
+          return [LockPath.new(path: primary.freeze, role: role)].freeze
+        end
 
         # Remove this temporary-registry compatibility path in 0.2.0. Until
         # then, acquiring both paths keeps released 0.1.2 processes coordinated
         # with output-adjacent locks.
-        compatibility = [legacy_temporary_lock_path(target.identity)]
-        ([primary] + compatibility.reject { |path| path == primary }).freeze
+        paths = [LockPath.new(path: primary.freeze, role: :canonical)]
+        paths << LockPath.new(path: legacy.freeze, role: :legacy) if VERSION.start_with?("0.1.") && legacy != primary
+        paths.freeze
       end
 
       def canonical_lock_path(identity)
@@ -239,34 +279,25 @@ module Cohere
         flags |= File::CLOEXEC if defined?(File::CLOEXEC)
         mode = shared ? shared_lock_file_mode(path.dirname.lstat) : 0o600
         begin
-          descriptor = ::IO.sysopen(path.to_s, flags | File::CREAT | File::EXCL, mode)
-          created = true
+          descriptor, created = open_or_create_lock_descriptor(path, flags, mode)
           access = "r+"
-        rescue Errno::EEXIST
-          begin
-            descriptor = ::IO.sysopen(path.to_s, flags, mode)
-            access = "r+"
-          rescue Errno::EACCES, Errno::EROFS
-            raise unless shared
+        rescue Errno::EACCES, Errno::EROFS => e
+          raise unless shared
 
-            readonly_flags = File::RDONLY
-            readonly_flags |= File::NOFOLLOW if defined?(File::NOFOLLOW)
-            readonly_flags |= File::CLOEXEC if defined?(File::CLOEXEC)
-            descriptor = ::IO.sysopen(path.to_s, readonly_flags)
-            access = "r"
-          end
+          handle, access = open_shared_lock_after_write_denial(path, flags, mode, e)
         end
-        handle = File.new(descriptor, access, autoclose: true)
-        descriptor = nil
+        unless handle
+          handle = File.new(descriptor, access, autoclose: true)
+          descriptor = nil
+        end
         opened = verify_lock_identity!(
           path,
           handle,
           message: "Output lock changed while it was being opened or is not regular"
         )
         if shared
-          if created || (access == "r+" && Process.respond_to?(:uid) && opened.uid == Process.uid)
-            apply_lock_mode_if_supported(handle, mode)
-          end
+          owned_writable = access == "r+" && Process.respond_to?(:uid) && opened.uid == Process.uid
+          apply_lock_mode_if_supported(handle, mode) if (created || owned_writable) && (opened.mode & 0o777) != mode
         else
           validate_owned_private_file!(opened, path)
         end
@@ -280,6 +311,20 @@ module Cohere
         elsif descriptor
           ::IO.new(descriptor).close
         end
+      end
+
+      def open_or_create_lock_descriptor(path, flags, mode)
+        2.times do
+          return [::IO.sysopen(path.to_s, flags, mode), false]
+        rescue Errno::ENOENT
+          begin
+            return [::IO.sysopen(path.to_s, flags | File::CREAT | File::EXCL, mode), true]
+          rescue Errno::EEXIST
+            next
+          end
+        end
+
+        raise Errno::ENOENT, path.to_s
       end
 
       def validate_lock_directory!(path, shared: false)
@@ -317,17 +362,31 @@ module Cohere
         end
 
         mode = (parent.mode & 0o3777) | 0o700
+        mode |= 0o1000 if mode.anybits?(0o022)
         begin
           Dir.mkdir(path, mode)
           apply_lock_mode_if_supported(path, mode)
         rescue Errno::EEXIST
           existing = path.lstat
-          if !Gem.win_platform? && Process.respond_to?(:uid) && existing.directory? && existing.uid == Process.uid
+          if !Gem.win_platform? && Process.respond_to?(:uid) && existing.directory? &&
+             existing.uid == Process.uid && (existing.mode & 0o3777) != mode
             apply_lock_mode_if_supported(path, mode)
           end
         rescue SystemCallError => e
           raise TranscriptionRuntimeError, "Cannot prepare output lock directory #{path}: #{e.message}"
         end
+        validate_shared_lock_directory_mode!(path)
+      end
+
+      def validate_shared_lock_directory_mode!(path)
+        return if Gem.win_platform?
+
+        stat = path.lstat
+        return unless stat.mode.anybits?(0o022)
+        return if stat.mode.anybits?(0o1000)
+
+        raise TranscriptionRuntimeError,
+              "Shared output lock directory must use the sticky bit: #{path}"
       end
 
       def shared_lock_file_mode(directory_stat)
@@ -341,6 +400,7 @@ module Cohere
         target.chmod(mode)
       rescue SystemCallError => e
         unsupported = [Errno::EPERM::Errno]
+        unsupported << Errno::EROFS::Errno
         unsupported << Errno::EOPNOTSUPP::Errno if defined?(Errno::EOPNOTSUPP)
         unsupported << Errno::ENOTSUP::Errno if defined?(Errno::ENOTSUP)
         raise unless unsupported.include?(e.errno)
@@ -354,6 +414,70 @@ module Cohere
         handle.flush
         handle.truncate(handle.pos)
         nil
+      end
+
+      def acquire_exclusive_file_lock(handle, operation, target:, path:)
+        handle.flock(operation)
+      rescue Errno::EBADF => e
+        raise TranscriptionRuntimeError,
+              "Cannot acquire an exclusive output lock for #{target.identity}: " \
+              "the filesystem requires a writable lock file at #{path}",
+              cause: e
+      end
+
+      def open_shared_lock_after_write_denial(path, flags, mode, original_error)
+        descriptor = ::IO.sysopen(path.to_s, readonly_lock_flags)
+        readonly = File.new(descriptor, "r", autoclose: true)
+        descriptor = nil
+        opened = verify_lock_identity!(
+          path,
+          readonly,
+          message: "Output lock changed while opening it read-only"
+        )
+        if original_error.is_a?(Errno::EACCES) &&
+           Process.respond_to?(:uid) && opened.uid == Process.uid
+          apply_lock_mode_if_supported(readonly, mode)
+          begin
+            descriptor = ::IO.sysopen(path.to_s, flags, mode)
+            writable = File.new(descriptor, "r+", autoclose: true)
+            descriptor = nil
+            readonly.close
+            readonly = nil
+            handle = writable
+            writable = nil
+            return [handle, "r+"]
+          rescue Errno::EACCES, Errno::EROFS
+            nil
+          end
+        end
+
+        handle = readonly
+        readonly = nil
+        [handle, "r"]
+      ensure
+        readonly&.close unless readonly&.closed?
+        writable&.close unless writable&.closed?
+        ::IO.new(descriptor).close if descriptor
+      end
+
+      def readonly_lock_flags
+        readonly_flags = File::RDONLY
+        readonly_flags |= File::NOFOLLOW if defined?(File::NOFOLLOW)
+        readonly_flags |= File::CLOEXEC if defined?(File::CLOEXEC)
+        readonly_flags
+      end
+
+      def ensure_lock_acquisition_allowed!(target)
+        return unless lock_acquisition_unwinding?
+
+        raise TranscriptionRuntimeError,
+              "Cannot acquire output lock for #{target.identity} while the current thread is terminating"
+      end
+
+      # Ruby exposes an in-progress Thread#kill unwind only through #status;
+      # pending_interrupt? is already false while ensure blocks are running.
+      def lock_acquisition_unwinding?
+        Thread.current.status == "aborting"
       end
 
       def inspect_lock_path!(path)

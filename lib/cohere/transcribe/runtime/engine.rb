@@ -382,7 +382,7 @@ module Cohere
             return skipped_result(entry, plan) if optimistic.action == :skip
           end
 
-          Output::Publication.with_plan_lock(plan) do
+          Output::Publication.with_plan_lock(plan) do |lock|
             decision = Output::Publication.revalidate(plan, resolved_options)
             case decision.action
             when :skip
@@ -394,7 +394,8 @@ module Cohere
                 plan,
                 decision,
                 resolved_options,
-                measurements
+                measurements,
+                lock
               )
             else
               PreparationItem.new(index: index, entry: entry, plan: plan)
@@ -402,7 +403,7 @@ module Cohere
           end
         end
 
-        def preflight_resumed_entry(index, entry, plan, decision, resolved_options, measurements)
+        def preflight_resumed_entry(index, entry, plan, decision, resolved_options, measurements, lock)
           prepared = Preparation::PreparedEntry.new(
             item: PreparationItem.new(index: index, entry: entry, plan: plan),
             snapshot: source_snapshot(entry.path),
@@ -421,6 +422,7 @@ module Cohere
             decision.generation_id,
             resolved_options,
             measurements,
+            lock: lock,
             defer_word_alignment: resolved_options.alignment == "word"
           )
         rescue FatalRuntimeError, ProgressCallbackError
@@ -580,7 +582,7 @@ module Cohere
           measurements.decode_seconds += prepared.decode_seconds
           measurements.vad_seconds += prepared.vad_seconds
           record_vad_measurements(measurements, prepared.vad_details)
-          Output::Publication.with_plan_lock(plan) do
+          Output::Publication.with_plan_lock(plan) do |lock|
             decision = Output::Publication.revalidate(plan, resolved_options)
             return skipped_result(entry, plan) if decision.action == :skip
 
@@ -598,11 +600,12 @@ module Cohere
                 decision.checkpoint,
                 decision.generation_id,
                 resolved_options,
-                measurements
+                measurements,
+                lock: lock
               )
             end
 
-            process_fresh_entry(prepared, resolved_options, measurements)
+            process_fresh_entry(prepared, resolved_options, measurements, lock: lock)
           end
         rescue FatalRuntimeError, ProgressCallbackError
           raise
@@ -620,7 +623,7 @@ module Cohere
           measurements.decode_seconds += prepared.decode_seconds
           measurements.vad_seconds += prepared.vad_seconds
           record_vad_measurements(measurements, prepared.vad_details)
-          outcome = Output::Publication.with_plan_lock(plan) do
+          outcome = Output::Publication.with_plan_lock(plan) do |lock|
             decision = Output::Publication.revalidate(plan, resolved_options)
             if decision.action == :skip
               WordPipeline::Final.new(index: item.index, result: skipped_result(entry, plan))
@@ -646,6 +649,7 @@ module Cohere
                   decision.generation_id,
                   resolved_options,
                   measurements,
+                  lock: lock,
                   defer_word_alignment: true
                 )
               else
@@ -653,6 +657,7 @@ module Cohere
                   prepared,
                   resolved_options,
                   measurements,
+                  lock: lock,
                   defer_word_alignment: true
                 )
               end
@@ -672,7 +677,7 @@ module Cohere
         def process_word_alignment(work, reload_result, resolved_options, measurements, alignment_state)
           entry = work.entry
           plan = work.plan
-          Output::Publication.with_plan_lock(plan) do
+          Output::Publication.with_plan_lock(plan) do |lock|
             decision = Output::Publication.revalidate(plan, resolved_options)
             return skipped_result(entry, plan) if decision.action == :skip
             if (alignment_error = alignment_state.fetch(:error))
@@ -690,6 +695,7 @@ module Cohere
               resolved_options,
               measurements,
               work.generation_id,
+              lock: lock,
               asr_evicted: true
             )
             ensure_source_unchanged!(entry.path, work.source_snapshot)
@@ -721,7 +727,7 @@ module Cohere
           record_alignment_measurements(measurements, before, aligner) if before && aligner
         end
 
-        def process_fresh_entry(prepared, resolved_options, measurements, defer_word_alignment: false)
+        def process_fresh_entry(prepared, resolved_options, measurements, lock:, defer_word_alignment: false)
           item = prepared.item
           entry = item.entry
           plan = item.plan
@@ -798,7 +804,8 @@ module Cohere
                                 speech_spans: speech_spans,
                                 vad_provider_options: vad_provider_options(vad_details),
                                 directory_binding: plan.directory_bindings.last,
-                                guard_bindings: plan.directory_bindings
+                                guard_bindings: plan.directory_bindings,
+                                lock: lock
                               )
                             ensure
                               measurements.checkpoint_seconds += monotonic - checkpoint_started
@@ -823,12 +830,13 @@ module Cohere
             plan,
             resolved_options,
             measurements,
-            generation_id
+            generation_id,
+            lock: lock
           )
         end
 
         def process_resumed_entry(prepared, checkpoint, generation_id, resolved_options, measurements,
-                                  defer_word_alignment: false)
+                                  lock:, defer_word_alignment: false)
           item = prepared.item
           entry = item.entry
           plan = item.plan
@@ -877,7 +885,8 @@ module Cohere
             plan,
             resolved_options,
             measurements,
-            generation_id
+            generation_id,
+            lock: lock
           )
         end
 
@@ -899,7 +908,7 @@ module Cohere
         end
 
         def render_and_publish(result, samples, segment_times, speech_spans, plan, resolved_options,
-                               measurements, generation_id, asr_evicted: false)
+                               measurements, generation_id, lock:, asr_evicted: false)
           progressive_started = monotonic unless resolved_options.alignment == "word"
           words, fallback_alignment_segments = words_for_segments(
             samples,
@@ -933,7 +942,8 @@ module Cohere
             result,
             resolved_options,
             generation_id: generation_id,
-            speech_spans: speech_spans
+            speech_spans: speech_spans,
+            lock: lock
           )
           if outputs.any?
             result = result.with(

@@ -154,6 +154,7 @@ abort "no packaged libcohere_audio found in #{directory}" unless audio_library
 audio_handle = Fiddle::Handle.new(audio_library, Fiddle::RTLD_NOW)
 audio_symbols = %w[
   cohere_audio_ffmpeg_probe
+  cohere_audio_ffmpeg_versions
   cohere_audio_ffmpeg_decode
   cohere_audio_ffmpeg_duration
   cohere_audio_ffmpeg_cancel
@@ -171,7 +172,32 @@ probe_status = probe.call(diagnostic, 1_024)
 raise "audio probe returned an invalid status" unless [0, 1].include?(probe_status)
 raise "audio probe returned no diagnostic" if diagnostic.to_s.empty?
 
+versions = Fiddle::Function.new(
+  audio_handle["cohere_audio_ffmpeg_versions"],
+  [Fiddle::TYPE_VOIDP, Fiddle::TYPE_SIZE_T],
+  Fiddle::TYPE_INT
+)
+raise "audio versions accepted a null output" unless versions.call(0, 0) == 2
+
 if probe_status.zero?
+  tuple_bytes = 4 * Fiddle::SIZEOF_INT
+  tuple = Fiddle::Pointer.malloc(tuple_bytes, Fiddle::RUBY_FREE)
+  tuple[0, tuple_bytes] = [0, 0, 0, 0].pack("i!*")
+  raise "audio versions call failed" unless versions.call(tuple, 4).zero?
+
+  format_major, codec_major, util_major, resample_major = tuple[0, tuple_bytes].unpack("i!4")
+  raise "audio versions returned an incompatible format/codec tuple" unless format_major == codec_major
+  raise "audio versions returned an incompatible avutil major" unless util_major == format_major - 2
+
+  expected_resample = if format_major == 58
+                        3
+                      elsif format_major <= 60
+                        4
+                      else
+                        format_major - 56
+                      end
+  raise "audio versions returned an incompatible swresample major" unless resample_major == expected_resample
+
   duration = Fiddle::Function.new(
     audio_handle["cohere_audio_ffmpeg_duration"],
     [Fiddle::TYPE_VOIDP, Fiddle::TYPE_VOIDP, Fiddle::TYPE_VOIDP, Fiddle::TYPE_SIZE_T],

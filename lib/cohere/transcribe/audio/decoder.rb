@@ -123,7 +123,7 @@ module Cohere
         DEFAULT_MONO_MIXES = {
           1 => [1.0],
           2 => [SQRT_HALF, SQRT_HALF],
-          3 => [SQRT_HALF, SQRT_HALF, 0.0],
+          3 => [SQRT_HALF, SQRT_HALF, 0.0], # FFmpeg's unspecified 3-channel default is 2.1, not 3.0
           4 => [SQRT_HALF, SQRT_HALF, 1.0, 0.5],
           5 => [SQRT_HALF, SQRT_HALF, 1.0, 0.5, 0.5],
           6 => [SQRT_HALF, SQRT_HALF, 1.0, 0.0, 0.5, 0.5],

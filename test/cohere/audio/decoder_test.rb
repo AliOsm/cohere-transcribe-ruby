@@ -324,6 +324,26 @@ module Cohere
           end
         end
 
+        def test_libsndfile_and_native_ffmpeg_match_unspecified_three_channel_2_1_layout
+          sound_file = Audio.const_get(:SoundFileABI, false)
+          skip "libsndfile is unavailable" unless sound_file.const_get(:AVAILABLE)
+          skip "native FFmpeg audio adapter is unavailable" unless FFmpegNative.available?
+
+          with_wav(
+            sample_rate: SAMPLE_RATE,
+            channels: 3,
+            frames: 400,
+            channel_values: [8_192, 4_096, 16_384]
+          ) do |path|
+            fallback = Decoder.decode(path, backend: "libsndfile")
+            native = Decoder.decode(path, backend: "ffmpeg")
+            expected = Math.sqrt(0.5) * 0.375
+
+            assert_in_delta expected, fallback.samples[200], 1e-6
+            assert_in_delta native.samples[200], fallback.samples[200], 1e-6
+          end
+        end
+
         def test_explicit_ffmpeg_uses_native_abi_or_fails_cleanly_when_adapter_is_absent
           with_wav(sample_rate: SAMPLE_RATE, channels: 1, frames: 10) do |path|
             if FFmpegNative.available?

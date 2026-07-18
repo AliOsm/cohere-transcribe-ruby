@@ -1,4 +1,5 @@
 _cohere_audio_ffmpeg_probe
+_cohere_audio_ffmpeg_versions
 _cohere_audio_ffmpeg_decode
 _cohere_audio_ffmpeg_duration
 _cohere_audio_ffmpeg_cancel

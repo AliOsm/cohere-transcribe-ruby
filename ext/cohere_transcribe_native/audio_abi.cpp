@@ -1338,6 +1338,26 @@ COHERE_AUDIO_EXPORT int cohere_audio_ffmpeg_probe(char* diagnostic, std::size_t 
     }
 }
 
+COHERE_AUDIO_EXPORT int cohere_audio_ffmpeg_versions(int* versions, std::size_t count) {
+    if (versions && count > 0)
+        std::fill_n(versions, std::min<std::size_t>(count, 4), 0);
+    if (!versions || count < 4)
+        return 2;
+
+    try {
+        Runtime& api = runtime();
+        if (!api.available)
+            return 1;
+        versions[0] = api.format_major;
+        versions[1] = api.codec_major;
+        versions[2] = api.util_major;
+        versions[3] = api.resample_major;
+        return 0;
+    } catch (...) {
+        return 1;
+    }
+}
+
 COHERE_AUDIO_EXPORT int cohere_audio_ffmpeg_decode(
     const char* path,
     int target_rate,

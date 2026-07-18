@@ -32,7 +32,7 @@ module Cohere
 
       def write_asr_checkpoint(path:, result:, source_snapshot:, asr_contract_key:,
                                speech_spans:, vad_provider_options: nil, generation_id: nil,
-                               directory_binding: nil, guard_bindings: nil)
+                               directory_binding: nil, guard_bindings: nil, lock: nil)
         generation_id = generation_id.to_s
         generation_id = SecureRandom.hex(16) if generation_id.empty?
         payload = asr_checkpoint_payload(
@@ -48,7 +48,8 @@ module Cohere
           payload,
           source_snapshot: source_snapshot,
           directory_binding: directory_binding,
-          guard_bindings: guard_bindings
+          guard_bindings: guard_bindings,
+          commit_guard: lock&.method(:verify!)
         )
         generation_id.freeze
       end

@@ -269,7 +269,7 @@ module Cohere
           plan.directory_bindings.each(&:verify!) if plan&.paths&.any?
         end
 
-        def write(plan, result, options, generation_id: nil, speech_spans: nil)
+        def write(plan, result, options, generation_id: nil, speech_spans: nil, lock: nil)
           return [].freeze if plan.paths.empty?
 
           contents = plan.paths.to_h do |format, _path|
@@ -291,7 +291,8 @@ module Cohere
             transaction_paths,
             transaction_contents,
             before_commit: -> { State.ensure_source_unchanged!(snapshot) },
-            directory_bindings: plan.directory_bindings
+            directory_bindings: plan.directory_bindings,
+            commit_guard: lock&.method(:verify!)
           )
           plan.paths.values.freeze
         end
@@ -844,13 +845,14 @@ module Cohere
         private_class_method :quantile
 
         def atomic_write_set(paths, contents, before_commit: nil, rename: nil,
-                             directory_bindings: nil, operation_hook: nil)
+                             directory_bindings: nil, operation_hook: nil, commit_guard: nil)
           staged = {}
           backups = {}
           committed = []
           preserved_backups = {}
           open_handles = []
-          failed = false
+          completed = false
+          primary_error = nil
           bound_directories = publication_bound_directories(paths, directory_bindings)
           operation_hook&.call(:directories_opened, nil)
           paths.each do |format, supplied_destination|
@@ -914,74 +916,100 @@ module Cohere
           end
           before_commit&.call
           bound_directories.each_value(&:verify!)
-          Thread.handle_interrupt(State::DEFERRED_PUBLICATION_EXCEPTIONS) do
-            staged.each do |destination, (bound, temporary_name)|
-              operation_hook&.call(:before_rename, destination)
-              if rename
-                committed << destination
-                rename.call(bound.display_path(temporary_name), destination)
+          Thread.handle_interrupt(State::DEFERRED_PUBLICATION_EXCEPTIONS) { commit_guard&.call }
+          staged.each do |destination, (bound, temporary_name)|
+            operation_hook&.call(:before_rename, destination)
+            if rename
+              # The caller-supplied operation may block. Record its rollback
+              # responsibility first, then leave it interruptible; if it is
+              # interrupted before or after moving the entry, the same backup
+              # restoration path is safe in both cases.
+              Thread.handle_interrupt(State::DEFERRED_PUBLICATION_EXCEPTIONS) { commit_guard&.call }
+              committed << destination
+              rename.call(bound.display_path(temporary_name), destination)
+              Thread.handle_interrupt(State::DEFERRED_PUBLICATION_EXCEPTIONS) do
                 bound.rename(temporary_name, destination.basename.to_s) if bound.regular_entry?(temporary_name)
-              else
+                commit_guard&.call
+              end
+            else
+              Thread.handle_interrupt(State::DEFERRED_PUBLICATION_EXCEPTIONS) do
+                commit_guard&.call
                 bound.rename(temporary_name, destination.basename.to_s)
                 committed << destination
               end
-              operation_hook&.call(:after_rename, destination)
-              bound.verify!
             end
-            bound_directories.each_value(&:fsync)
-            bound_directories.each_value(&:verify!)
+            operation_hook&.call(:after_rename, destination)
+            bound.verify!
+            Thread.handle_interrupt(State::DEFERRED_PUBLICATION_EXCEPTIONS) { commit_guard&.call }
+          end
+          bound_directories.each_value do |bound|
+            Thread.handle_interrupt(State::DEFERRED_PUBLICATION_EXCEPTIONS) do
+              commit_guard&.call
+              bound.fsync
+              commit_guard&.call
+            end
+            bound.verify!
+          end
+          Thread.handle_interrupt(State::DEFERRED_PUBLICATION_EXCEPTIONS) do
+            commit_guard&.call
+            completed = true
           end
         rescue Exception => e # rubocop:disable Lint/RescueException -- rollback must include interrupts
-          failed = true
-          rollback_errors = []
-          committed.reverse_each do |destination|
-            backup = backups[destination]
-            bound, backup_name = backup
-            bound ||= staged.fetch(destination).first
-            begin
-              Thread.handle_interrupt(State::DEFERRED_PUBLICATION_EXCEPTIONS) do
-                bound.unlink(destination.basename.to_s, missing_ok: true)
-                bound.rename(backup_name, destination.basename.to_s) if backup_name
+          primary_error = e
+          raise
+        ensure
+          Thread.handle_interrupt(State::DEFERRED_PUBLICATION_EXCEPTIONS) do
+            rollback_errors = []
+            unless completed
+              committed.reverse_each do |destination|
+                backup = backups[destination]
+                bound, backup_name = backup
+                bound ||= staged.fetch(destination).first
+                begin
+                  bound.unlink(destination.basename.to_s, missing_ok: true)
+                  bound.rename(backup_name, destination.basename.to_s) if backup_name
+                rescue SystemCallError, TranscriptionRuntimeError => e
+                  preserved_backups[backup] = true if backup_name
+                  rollback_errors << "#{destination}: #{e.message}"
+                end
               end
-            rescue SystemCallError, TranscriptionRuntimeError => rollback_error
-              preserved_backups[backup] = true if backup_name
-              rollback_errors << "#{destination}: #{rollback_error.message}"
+              begin
+                bound_directories&.each_value(&:fsync)
+              rescue SystemCallError, TranscriptionRuntimeError => e
+                rollback_errors << "directory sync: #{e.message}"
+              end
+            end
+            cleanup_errors = []
+            staged&.each_value do |bound, name|
+              bound.unlink(name, missing_ok: true)
+            rescue SystemCallError, TranscriptionRuntimeError => e
+              cleanup_errors << e
+            end
+            backups&.each_value do |backup|
+              next unless backup && !preserved_backups&.key?(backup)
+
+              bound, name = backup
+              bound.unlink(name, missing_ok: true)
+            rescue SystemCallError, TranscriptionRuntimeError => e
+              cleanup_errors << e
+            end
+            open_handles&.each { |handle| handle.close unless handle.closed? }
+            bound_directories&.each_value(&:close)
+            if rollback_errors.any? && primary_error
+              detail = rollback_errors.join("; ")
+              retained = preserved_backups.keys.filter_map do |backup|
+                backup&.then { |bound, name| bound.display_path(name).to_s }
+              end.sort
+              raise TranscriptionRuntimeError,
+                    "Output commit failed and rollback was incomplete (#{detail}); " \
+                    "preserved backups: #{retained}",
+                    cause: primary_error
+            end
+            if cleanup_errors.any? && completed && primary_error.nil? &&
+               Thread.current.status != "aborting"
+              raise cleanup_errors.first
             end
           end
-          begin
-            bound_directories&.each_value(&:fsync)
-          rescue SystemCallError, TranscriptionRuntimeError => rollback_error
-            rollback_errors << "directory sync: #{rollback_error.message}"
-          end
-          if rollback_errors.any?
-            detail = rollback_errors.join("; ")
-            retained = preserved_backups.keys.filter_map do |backup|
-              backup&.then { |bound, name| bound.display_path(name).to_s }
-            end.sort
-            raise TranscriptionRuntimeError,
-                  "Output commit failed and rollback was incomplete (#{detail}); " \
-                  "preserved backups: #{retained}",
-                  cause: e
-          end
-          raise e
-        ensure
-          cleanup_errors = []
-          staged&.each_value do |bound, name|
-            bound.unlink(name, missing_ok: true)
-          rescue SystemCallError, TranscriptionRuntimeError => e
-            cleanup_errors << e
-          end
-          backups&.each_value do |backup|
-            next unless backup && !preserved_backups&.key?(backup)
-
-            bound, name = backup
-            bound.unlink(name, missing_ok: true)
-          rescue SystemCallError, TranscriptionRuntimeError => e
-            cleanup_errors << e
-          end
-          open_handles&.each { |handle| handle.close unless handle.closed? }
-          bound_directories&.each_value(&:close)
-          raise cleanup_errors.first if cleanup_errors.any? && !failed
         end
 
         def publication_bound_directories(paths, directory_bindings)

@@ -69,6 +69,37 @@ module Cohere
         end
       end
 
+      def test_checkpoint_refuses_to_commit_after_its_output_lock_is_replaced
+        Dir.mktmpdir("cohere-checkpoint-lock-identity") do |directory|
+          root = Pathname(directory)
+          source = root.join("clip.wav")
+          source.binwrite("audio")
+          snapshot = State::SourceSnapshot.capture(source)
+          checkpoint_path = root.join(".clip#{State::CHECKPOINT_SUFFIX}")
+          target = State.lock_target_for_outputs("txt" => root.join("clip.txt"))
+
+          State.with_output_lock(target) do |lock|
+            parked = target.path.sub_ext(".parked")
+            target.path.rename(parked)
+            target.path.binwrite("")
+
+            error = assert_raises(TranscriptionRuntimeError) do
+              State.write_asr_checkpoint(
+                path: checkpoint_path,
+                result: result(source),
+                source_snapshot: snapshot,
+                asr_contract_key: State.asr_contract_key(options),
+                speech_spans: [[0.0, 1.0]],
+                lock: lock
+              )
+            end
+
+            assert_match(/changed while held/, error.message)
+            refute checkpoint_path.exist?
+          end
+        end
+      end
+
       def test_invalid_checkpoint_is_rejected_without_mutating_callers
         Dir.mktmpdir do |directory|
           root = Pathname(directory)
@@ -861,6 +892,55 @@ module Cohere
         end
       end
 
+      def test_thread_kill_during_state_rollback_waits_for_sync_and_cleanup
+        original_fsync = State::BoundDirectory.instance_method(:fsync)
+        rollback_sync_started = Queue.new
+        finish_rollback_sync = Queue.new
+        State::BoundDirectory.define_method(:fsync) do
+          rollback_sync_started << true
+          finish_rollback_sync.pop
+          original_fsync.bind_call(self)
+        end
+
+        Dir.mktmpdir("cohere-state-rollback-termination") do |directory|
+          root = Pathname(directory)
+          source = root.join("clip.wav")
+          marker = root.join("marker.json")
+          source.binwrite("audio")
+          marker.binwrite("old state")
+          hook = lambda do |phase, _path|
+            raise TranscriptionRuntimeError, "force rollback" if phase == :after_rename
+          end
+          caller = Thread.new do
+            State.write_state_atomic(
+              marker,
+              { "kind" => "new" },
+              source_snapshot: State::SourceSnapshot.capture(source),
+              directory_binding: State::DirectoryBinding.capture(root),
+              operation_hook: hook
+            )
+          end
+          caller.report_on_exception = false
+
+          Timeout.timeout(2) { rollback_sync_started.pop }
+          caller.kill
+          Thread.pass
+          assert caller.alive?, "termination interrupted state rollback"
+
+          finish_rollback_sync << true
+          assert caller.join(2), "state writer remained stuck after rollback"
+          assert_nil caller.value
+          assert_equal "old state", marker.binread
+          assert_empty(root.children.select { |path| %w[.tmp .bak].include?(path.extname) })
+        ensure
+          finish_rollback_sync << true
+          caller&.kill
+          caller&.join
+        end
+      ensure
+        State::BoundDirectory.define_method(:fsync, original_fsync) if original_fsync
+      end
+
       def test_thread_kill_after_state_rename_finishes_the_marker_commit
         Dir.mktmpdir("cohere-state-rename-termination") do |directory|
           root = Pathname(directory)
@@ -893,6 +973,48 @@ module Cohere
           caller&.kill
           caller&.join
         end
+      end
+
+      def test_state_cleanup_failure_does_not_replace_thread_kill_after_commit
+        original_unlink = State::BoundDirectory.instance_method(:unlink)
+        State::BoundDirectory.define_method(:unlink) do |name, missing_ok: false|
+          raise Errno::EIO, "forced cleanup failure" if name.end_with?(".tmp")
+
+          original_unlink.bind_call(self, name, missing_ok: missing_ok)
+        end
+
+        Dir.mktmpdir("cohere-state-cleanup-termination") do |directory|
+          root = Pathname(directory)
+          source = root.join("clip.wav")
+          marker = root.join("marker.json")
+          source.binwrite("audio")
+          marker.binwrite("old state")
+          hook = lambda do |phase, _path|
+            next unless phase == :after_rename
+
+            publishing_thread = Thread.current
+            Thread.new { publishing_thread.kill }.join
+          end
+          caller = Thread.new do
+            State.write_state_atomic(
+              marker,
+              { "kind" => "new" },
+              source_snapshot: State::SourceSnapshot.capture(source),
+              directory_binding: State::DirectoryBinding.capture(root),
+              operation_hook: hook
+            )
+          end
+          caller.report_on_exception = false
+
+          assert caller.join(2), "state publisher remained stuck after termination"
+          assert_nil caller.value
+          assert_includes marker.binread, '"kind": "new"'
+        ensure
+          caller&.kill
+          caller&.join
+        end
+      ensure
+        State::BoundDirectory.define_method(:unlink, original_unlink) if original_unlink
       end
 
       def test_output_lock_identity_is_output_adjacent_and_independent_of_cache_environment
@@ -976,6 +1098,26 @@ module Cohere
         end
       end
 
+      def test_world_writable_output_parent_creates_a_sticky_shared_lock_registry
+        skip "mode bits are unavailable" if Gem.win_platform?
+
+        Dir.mktmpdir("cohere-lock-sticky-registry") do |directory|
+          output_parent = Pathname(directory).join("outputs")
+          output_parent.mkdir
+          output_parent.chmod(0o777)
+          target = State.lock_target_for_outputs("txt" => output_parent.join("clip.txt"))
+
+          lock = State::OutputSetLock.acquire(target)
+          begin
+            assert_equal 0o1777, target.path.dirname.stat.mode & 0o1777
+            assert_equal 0o666, target.path.stat.mode & 0o777
+            assert_equal 23, run_lock_child(target)
+          ensure
+            lock.release
+          end
+        end
+      end
+
       def test_output_lock_accepts_an_existing_non_private_adjacent_registry
         Dir.mktmpdir("cohere-lock-shared-registry") do |directory|
           output_parent = Pathname(directory).join("outputs")
@@ -992,6 +1134,30 @@ module Cohere
           end
           assert_equal 0, run_lock_child(target)
         end
+      end
+
+      def test_output_lock_rejects_a_shared_writable_registry_without_a_sticky_bit
+        skip "mode bits are unavailable" if Gem.win_platform?
+
+        original_apply_mode = State.method(:apply_lock_mode_if_supported)
+        Dir.mktmpdir("cohere-lock-missing-sticky") do |directory|
+          output_parent = Pathname(directory).join("outputs")
+          output_parent.mkdir
+          output_parent.chmod(0o770)
+          target = State.lock_target_for_outputs("txt" => output_parent.join("clip.txt"))
+          target.path.dirname.mkdir(0o770)
+          target.path.dirname.chmod(0o770)
+          State.define_singleton_method(:apply_lock_mode_if_supported) { |_target, _mode| nil }
+
+          error = assert_raises(TranscriptionRuntimeError) do
+            State::OutputSetLock.acquire(target)
+          end
+
+          assert_match(/must use the sticky bit/, error.message)
+          assert_empty State::OutputSetLock.active
+        end
+      ensure
+        State.define_singleton_method(:apply_lock_mode_if_supported, original_apply_mode) if original_apply_mode
       end
 
       def test_output_lock_reconciles_an_owned_private_registry_for_a_shared_parent
@@ -1014,7 +1180,7 @@ module Cohere
         end
       end
 
-      def test_output_lock_can_flock_an_existing_read_only_adjacent_file
+      def test_output_lock_repairs_an_owned_read_only_adjacent_file_before_flocking
         skip "read-only mode bits are unavailable" if Gem.win_platform?
 
         Dir.mktmpdir("cohere-lock-readonly-file") do |directory|
@@ -1027,7 +1193,9 @@ module Cohere
 
           lock = State::OutputSetLock.acquire(target)
           begin
-            assert_equal 0o444, target.path.stat.mode & 0o777
+            expected_mode = State.shared_lock_file_mode(target.path.dirname.lstat)
+            assert_equal expected_mode, target.path.stat.mode & 0o777
+            assert_predicate target.path, :writable?
             assert_equal 23, run_lock_child(target)
           ensure
             lock.release
@@ -1046,6 +1214,9 @@ module Cohere
         target = Object.new
         target.define_singleton_method(:chmod) { |_mode| raise unsupported }
 
+        assert_nil State.apply_lock_mode_if_supported(target, 0o770)
+
+        target.define_singleton_method(:chmod) { |_mode| raise Errno::EROFS, "read-only filesystem" }
         assert_nil State.apply_lock_mode_if_supported(target, 0o770)
       end
 
@@ -1215,6 +1386,39 @@ module Cohere
         end
       end
 
+      def test_output_lock_acquisition_is_rejected_during_thread_kill_unwind
+        Dir.mktmpdir("cohere-lock-kill-unwind") do |directory|
+          target = State.lock_target_for_outputs(
+            "txt" => Pathname(directory).join("clip.txt")
+          )
+          started = Queue.new
+          observed = Queue.new
+          caller = Thread.new do
+            started << true
+            sleep
+          ensure
+            begin
+              State::OutputSetLock.acquire(target)
+            rescue Exception => e # rubocop:disable Lint/RescueException -- observe kill-unwind behavior
+              observed << e
+            end
+          end
+          caller.report_on_exception = false
+
+          started.pop
+          caller.kill
+          error = Timeout.timeout(2) { observed.pop }
+          assert_instance_of TranscriptionRuntimeError, error
+          assert_match(/current thread is terminating/, error.message)
+          assert caller.join(2), "lock caller remained stuck while terminating"
+          assert_empty State::OutputSetLock.active
+          refute target.path.exist?
+        ensure
+          caller&.kill
+          caller&.join
+        end
+      end
+
       def test_with_output_lock_preserves_the_protected_failure_when_release_also_fails
         original_acquire = State::OutputSetLock.method(:acquire)
         release_failure = Errno::EIO.new("release failed")
@@ -1336,6 +1540,31 @@ module Cohere
         assert_match(/Cannot acquire output lock/, error.message)
         assert_instance_of Errno::ENOLCK, error.cause
         assert_equal [["candidate", :lock], ["candidate", :unlock], ["candidate", :close]], events
+        assert_empty State::OutputSetLock.active
+      ensure
+        State.define_singleton_method(:open_lock_file, original_open_lock_file) if original_open_lock_file
+      end
+
+      def test_read_only_descriptor_rejected_by_nfs_fails_with_actionable_lock_error
+        original_open_lock_file = State.method(:open_lock_file)
+        events = []
+        handle = fake_lock_handle("readonly", events)
+        handle.define_singleton_method(:flock) do |operation|
+          events << ["readonly", operation == File::LOCK_UN ? :unlock : :lock]
+          raise Errno::EBADF, "write lock requires a writable descriptor" unless operation == File::LOCK_UN
+
+          true
+        end
+        State.define_singleton_method(:open_lock_file) { |_path, **| handle }
+        target = State::OutputLockTarget.new(path: Pathname("/unused/custom.lock"), identity: "test output")
+
+        error = assert_raises(TranscriptionRuntimeError) do
+          State::OutputSetLock.acquire(target)
+        end
+
+        assert_match(/filesystem requires a writable lock file/, error.message)
+        assert_instance_of Errno::EBADF, error.cause
+        assert_equal [["readonly", :lock], ["readonly", :unlock], ["readonly", :close]], events
         assert_empty State::OutputSetLock.active
       ensure
         State.define_singleton_method(:open_lock_file, original_open_lock_file) if original_open_lock_file
@@ -1466,6 +1695,35 @@ module Cohere
         end
       end
 
+      def test_held_output_lock_rechecks_every_path_before_commit
+        Dir.mktmpdir("cohere-held-lock-identity") do |directory|
+          target = State.lock_target_for_outputs(
+            "txt" => Pathname(directory).join("clip.txt")
+          )
+          lock = State::OutputSetLock.acquire(target)
+          parked = target.path.sub_ext(".parked")
+          target.path.rename(parked)
+          target.path.binwrite("")
+
+          error = assert_raises(TranscriptionRuntimeError) { lock.verify! }
+          assert_match(/changed while held/, error.message)
+          refute lock.released?
+
+          lock.release
+          released_error = assert_raises(TranscriptionRuntimeError) { lock.verify! }
+          assert_match(/released before committing/, released_error.message)
+        ensure
+          lock&.release
+        end
+      end
+
+      def test_legacy_lock_compatibility_has_an_enforced_version_sunset
+        removal = State.const_get(:LEGACY_LOCK_REMOVAL_VERSION, false)
+
+        assert_equal "0.2.0", removal
+        assert_match(/\A0\.1\./, Cohere::Transcribe::VERSION, "remove the legacy lock before #{removal}")
+      end
+
       def test_signal_during_lock_acquisition_closes_and_unlocks_the_descriptor
         skip "Linux file descriptor accounting is unavailable" unless Pathname("/proc/self/fd").directory?
 
@@ -1494,6 +1752,31 @@ module Cohere
           ensure
             GC.enable unless garbage_collection_was_disabled
           end
+        end
+      end
+
+      def test_signal_after_direct_lock_handoff_releases_every_registered_path
+        Dir.mktmpdir("cohere-lock-direct-handoff") do |directory|
+          target = State.lock_target_for_outputs(
+            "txt" => Pathname(directory).join("clip.txt")
+          )
+          source_path = State::OutputSetLock.method(:acquire).source_location.fetch(0)
+          handoff_line = File.readlines(source_path).index { |line| line.match?(/^\s+lock\s*$/) } + 1
+          trace = TracePoint.new(:line) do |event|
+            next unless event.path == source_path && event.lineno == handoff_line
+
+            raise Interrupt, "stop after direct lock handoff"
+          end
+
+          error = assert_raises(Interrupt) do
+            trace.enable { State::OutputSetLock.acquire(target) }
+          end
+
+          assert_match(/direct lock handoff/, error.message)
+          assert_empty State::OutputSetLock.active
+          assert_equal 0, run_lock_child(target)
+        ensure
+          trace&.disable
         end
       end
 
