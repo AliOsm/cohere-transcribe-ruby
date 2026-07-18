@@ -853,6 +853,7 @@ module Cohere
           open_handles = []
           completed = false
           primary_error = nil
+          recovery_errors = []
           bound_directories = publication_bound_directories(paths, directory_bindings)
           operation_hook&.call(:directories_opened, nil)
           paths.each do |format, supplied_destination|
@@ -902,15 +903,23 @@ module Cohere
               backups[destination] = [bound, backup_name].freeze
               open_handles << backup
             end
+            backup_copy_error = nil
             begin
               backup.chmod(source.stat.mode & 0o7777)
               operation_hook&.call(:before_backup_copy, destination)
               IO.copy_stream(source, backup)
               backup.flush
               backup.fsync
+            rescue Exception => e # rubocop:disable Lint/RescueException -- retain the copy failure through close
+              backup_copy_error = e
+              raise
             ensure
-              source.close
-              backup.close
+              close_failures = State.close_atomic_resources(
+                [source, backup],
+                recovery_errors,
+                label: ->(handle) { handle.respond_to?(:path) ? handle.path : destination }
+              )
+              raise close_failures.first if close_failures.any? && backup_copy_error.nil?
             end
             bound.verify!
           end
@@ -959,7 +968,6 @@ module Cohere
           raise
         ensure
           Thread.handle_interrupt(State::DEFERRED_PUBLICATION_EXCEPTIONS) do
-            rollback_errors = []
             unless completed
               committed.reverse_each do |destination|
                 backup = backups[destination]
@@ -968,22 +976,22 @@ module Cohere
                 begin
                   bound.unlink(destination.basename.to_s, missing_ok: true)
                   bound.rename(backup_name, destination.basename.to_s) if backup_name
+                  backups[destination] = nil
                 rescue SystemCallError, TranscriptionRuntimeError => e
                   preserved_backups[backup] = true if backup_name
-                  rollback_errors << "#{destination}: #{e.message}"
+                  recovery_errors << "#{destination}: #{e.message}"
                 end
               end
               begin
                 bound_directories&.each_value(&:fsync)
               rescue SystemCallError, TranscriptionRuntimeError => e
-                rollback_errors << "directory sync: #{e.message}"
+                recovery_errors << "directory sync: #{e.message}"
               end
             end
-            cleanup_errors = []
             staged&.each_value do |bound, name|
               bound.unlink(name, missing_ok: true)
             rescue SystemCallError, TranscriptionRuntimeError => e
-              cleanup_errors << [bound.display_path(name), e]
+              recovery_errors << "cleanup #{bound.display_path(name)}: #{e.message}"
             end
             backups&.each_value do |backup|
               next unless backup && !preserved_backups&.key?(backup)
@@ -992,40 +1000,28 @@ module Cohere
               bound.unlink(name, missing_ok: true)
             rescue SystemCallError, TranscriptionRuntimeError => e
               preserved_backups[backup] = true
-              cleanup_errors << [bound.display_path(name), e]
+              recovery_errors << "cleanup #{bound.display_path(name)}: #{e.message}"
             end
-            open_handles&.each { |handle| handle.close unless handle.closed? }
-            bound_directories&.each_value(&:close)
-            recovery_errors = rollback_errors + cleanup_errors.map do |path, error|
-              "cleanup #{path}: #{error.message}"
+            State.close_atomic_resources(
+              open_handles,
+              recovery_errors,
+              label: ->(handle) { handle.respond_to?(:path) ? handle.path : handle.inspect }
+            )
+            State.close_atomic_resources(
+              bound_directories&.values,
+              recovery_errors,
+              label: ->(bound) { bound.binding.canonical_path }
+            )
+            retained = preserved_backups.keys.filter_map do |backup|
+              backup&.then { |bound, name| bound.display_path(name) }
             end
-            # Thread#kill and nonlocal throw/return unwinds run this ensure
-            # without entering the rescue above. In that case completed is the
-            # authoritative signal that a failed recovery must replace the
-            # otherwise silent unwind with an actionable typed error.
-            if recovery_errors.any? && !completed && primary_error.nil?
-              detail = recovery_errors.join("; ")
-              retained = preserved_backups.keys.filter_map do |backup|
-                backup&.then { |bound, name| bound.display_path(name).to_s }
-              end.sort
-              raise TranscriptionRuntimeError,
-                    "Output commit did not complete and recovery was incomplete (#{detail}); " \
-                    "preserved backups: #{retained}"
-            end
-            if recovery_errors.any? && primary_error
-              detail = recovery_errors.join("; ")
-              retained = preserved_backups.keys.filter_map do |backup|
-                backup&.then { |bound, name| bound.display_path(name).to_s }
-              end.sort
-              raise TranscriptionRuntimeError,
-                    "Output commit failed and recovery was incomplete (#{detail}); " \
-                    "preserved backups: #{retained}",
-                    cause: primary_error
-            end
-            if cleanup_errors.any? && completed && primary_error.nil? &&
-               Thread.current.status != "aborting"
-              raise cleanup_errors.first.last
-            end
+            State.finish_atomic_recovery!(
+              subject: "Output commit",
+              completed: completed,
+              primary_error: primary_error,
+              recovery_errors: recovery_errors,
+              retained_backups: retained
+            )
           end
         end
 
@@ -1063,16 +1059,6 @@ module Cohere
           existing&.close
         end
         private_class_method :bound_output_mode
-
-        def fsync_directories(directories)
-          directories.each do |directory|
-            File.open(directory, File::RDONLY, &:fsync)
-          rescue Errno::EACCES, Errno::EBADF, Errno::EINVAL, Errno::EISDIR,
-                 Errno::ENOTSUP, Errno::EPERM
-            next
-          end
-        end
-        private_class_method :fsync_directories
 
         def source_record(path)
           State::SourceSnapshot.capture(path)

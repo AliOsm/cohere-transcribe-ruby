@@ -371,7 +371,45 @@ module Cohere
 
       module_function
 
-      def with_bound_parent(path, directory_binding: nil, guard_bindings: nil)
+      def finish_atomic_recovery!(subject:, completed:, primary_error:, recovery_errors:,
+                                  retained_backups:)
+        return if recovery_errors.empty?
+        return if completed && primary_error.nil? && Thread.current.status == "aborting"
+
+        outcome = if completed
+                    "completed but cleanup was incomplete"
+                  elsif primary_error
+                    "failed and recovery was incomplete"
+                  else
+                    "did not complete and recovery was incomplete"
+                  end
+        detail = recovery_errors.join("; ")
+        retained = retained_backups.compact.map(&:to_s).uniq.sort
+        retained_detail = if retained.empty?
+                            ""
+                          elsif retained.one?
+                            "; preserved backup: #{retained.first}"
+                          else
+                            "; preserved backups: #{retained}"
+                          end
+        raise TranscriptionRuntimeError,
+              "#{subject} #{outcome} (#{detail})#{retained_detail}",
+              cause: primary_error
+      end
+
+      def close_atomic_resources(resources, recovery_errors, label:)
+        failures = []
+        Array(resources).compact.uniq.each do |resource|
+          resource.close unless resource.respond_to?(:closed?) && resource.closed?
+        rescue SystemCallError, IOError, TranscriptionRuntimeError => e
+          recovery_errors << "close #{label.call(resource)}: #{e.message}"
+          failures << e
+        end
+        failures
+      end
+
+      def with_bound_parent(path, directory_binding: nil, guard_bindings: nil,
+                            recovery_errors: nil)
         path = Pathname(path).expand_path
         directory_binding ||= DirectoryBinding.capture(path.dirname)
         unless [directory_binding.access_path, directory_binding.canonical_path].include?(path.dirname)
@@ -384,9 +422,28 @@ module Cohere
         Thread.handle_interrupt(DEFERRED_PUBLICATION_EXCEPTIONS) do
           bound = BoundDirectory.open(directory_binding, guards: guards.uniq)
         end
-        yield bound, path.basename.to_s
+        completed = false
+        primary_error = nil
+        begin
+          result = yield bound, path.basename.to_s
+          completed = true
+          result
+        rescue Exception => e # rubocop:disable Lint/RescueException -- preserve the active outcome through close
+          primary_error = e
+          raise
+        end
       ensure
-        bound&.close
+        close_errors = recovery_errors || []
+        close_atomic_resources([bound], close_errors, label: ->(resource) { resource.binding.canonical_path })
+        unless recovery_errors
+          finish_atomic_recovery!(
+            subject: "Publication directory operation",
+            completed: completed,
+            primary_error: primary_error,
+            recovery_errors: close_errors,
+            retained_backups: []
+          )
+        end
       end
 
       def ensure_bound_directory(path, root_binding: nil, operation_hook: nil)
@@ -519,123 +576,154 @@ module Cohere
                              commit_guard: nil)
         path = Pathname(path).expand_path
         directory_binding ||= ensure_bound_directory(path.dirname)
-        with_bound_parent(
-          path,
-          directory_binding: directory_binding,
-          guard_bindings: guard_bindings
-        ) do |bound, basename|
-          operation_hook&.call(:directory_opened, path)
-          temporary_name = nil
-          temporary = nil
-          backup_name = nil
-          backup = nil
-          source = nil
-          committed = false
-          preserved_backup = false
-          primary_failed = false
-          begin
-            mode = bound_state_mode(bound, basename)
-            Thread.handle_interrupt(DEFERRED_PUBLICATION_EXCEPTIONS) do
-              temporary_name, temporary = bound.create_temporary(basename, ".tmp")
-            end
-            temporary.chmod(mode)
-            operation_hook&.call(:before_stage_write, path)
-            temporary.write(JSON.pretty_generate(envelope(payload)))
-            temporary.write("\n")
-            temporary.flush
-            temporary.fsync
-            temporary.close
+        recovery_errors = []
+        retained_backups = []
+        completed = false
+        primary_error = nil
+        begin
+          with_bound_parent(
+            path,
+            directory_binding: directory_binding,
+            guard_bindings: guard_bindings,
+            recovery_errors: recovery_errors
+          ) do |bound, basename|
+            operation_hook&.call(:directory_opened, path)
+            temporary_name = nil
             temporary = nil
-            bound.verify!
-
-            operation_hook&.call(:before_backup_open, path)
-            Thread.handle_interrupt(DEFERRED_PUBLICATION_EXCEPTIONS) do
-              source = begin
-                bound.open_regular(basename)
-              rescue Errno::ENOENT
-                nil
-              end
-            end
-            if source
+            backup_name = nil
+            backup = nil
+            source = nil
+            committed = false
+            begin
+              mode = bound_state_mode(bound, basename)
               Thread.handle_interrupt(DEFERRED_PUBLICATION_EXCEPTIONS) do
-                backup_name, backup = bound.create_temporary(basename, ".bak")
+                temporary_name, temporary = bound.create_temporary(basename, ".tmp")
               end
-              begin
-                backup.chmod(source.stat.mode & 0o7777)
-                operation_hook&.call(:before_backup_copy, path)
-                IO.copy_stream(source, backup)
-                backup.flush
-                backup.fsync
-              ensure
-                source.close
-                backup.close
-              end
-            end
-
-            ensure_source_unchanged!(source_snapshot)
-            bound.verify!
-            operation_hook&.call(:before_rename, path)
-            Thread.handle_interrupt(DEFERRED_PUBLICATION_EXCEPTIONS) do
-              commit_guard&.call
-              if rename
-                committed = true
-                rename.call(bound, temporary_name, basename, :commit)
-              else
-                bound.rename(temporary_name, basename)
-                committed = true
-              end
-              operation_hook&.call(:after_rename, path)
+              temporary.chmod(mode)
+              operation_hook&.call(:before_stage_write, path)
+              temporary.write(JSON.pretty_generate(envelope(payload)))
+              temporary.write("\n")
+              temporary.flush
+              temporary.fsync
+              temporary.close
+              temporary = nil
               bound.verify!
-              bound.fsync
-              commit_guard&.call
-            end
-            path
-          rescue Exception => e # rubocop:disable Lint/RescueException -- rollback includes interrupts
-            primary_failed = true
-            Thread.handle_interrupt(DEFERRED_PUBLICATION_EXCEPTIONS) do
-              if committed
+
+              operation_hook&.call(:before_backup_open, path)
+              Thread.handle_interrupt(DEFERRED_PUBLICATION_EXCEPTIONS) do
+                source = begin
+                  bound.open_regular(basename)
+                rescue Errno::ENOENT
+                  nil
+                end
+              end
+              if source
+                Thread.handle_interrupt(DEFERRED_PUBLICATION_EXCEPTIONS) do
+                  backup_name, backup = bound.create_temporary(basename, ".bak")
+                end
+                backup_copy_error = nil
                 begin
-                  bound.unlink(basename, missing_ok: true)
-                  if backup_name
-                    if rename
-                      rename.call(bound, backup_name, basename, :rollback)
-                    else
-                      bound.rename(backup_name, basename)
+                  backup.chmod(source.stat.mode & 0o7777)
+                  operation_hook&.call(:before_backup_copy, path)
+                  IO.copy_stream(source, backup)
+                  backup.flush
+                  backup.fsync
+                rescue Exception => e # rubocop:disable Lint/RescueException -- retain the copy failure through close
+                  backup_copy_error = e
+                  raise
+                ensure
+                  close_failures = close_atomic_resources(
+                    [source, backup],
+                    recovery_errors,
+                    label: ->(handle) { handle.respond_to?(:path) ? handle.path : path }
+                  )
+                  raise close_failures.first if close_failures.any? && backup_copy_error.nil?
+                end
+              end
+
+              ensure_source_unchanged!(source_snapshot)
+              bound.verify!
+              operation_hook&.call(:before_rename, path)
+              Thread.handle_interrupt(DEFERRED_PUBLICATION_EXCEPTIONS) do
+                commit_guard&.call
+                if rename
+                  committed = true
+                  rename.call(bound, temporary_name, basename, :commit)
+                else
+                  bound.rename(temporary_name, basename)
+                  committed = true
+                end
+                operation_hook&.call(:after_rename, path)
+                bound.verify!
+                bound.fsync
+                commit_guard&.call
+                completed = true
+              end
+              path
+            rescue Exception => e # rubocop:disable Lint/RescueException -- rollback includes interrupts
+              primary_error = e
+              raise
+            ensure
+              Thread.handle_interrupt(DEFERRED_PUBLICATION_EXCEPTIONS) do
+                if !completed && committed
+                  begin
+                    bound.unlink(basename, missing_ok: true)
+                    if backup_name
+                      if rename
+                        rename.call(bound, backup_name, basename, :rollback)
+                      else
+                        bound.rename(backup_name, basename)
+                      end
+                      backup_name = nil
                     end
+                  rescue StandardError => e
+                    retained_backups << bound.display_path(backup_name) if backup_name
+                    recovery_errors << "#{path}: #{e.message}"
                   end
-                  backup_name = nil
-                  bound.fsync
-                rescue SystemCallError, TranscriptionRuntimeError => rollback_error
-                  retained = backup_name ? bound.display_path(backup_name) : nil
-                  preserved_backup = !backup_name.nil?
-                  raise TranscriptionRuntimeError,
-                        "State commit failed and rollback was incomplete (#{rollback_error.message}); " \
-                        "preserved backup: #{retained}",
-                        cause: e
+                  begin
+                    bound.fsync
+                  rescue SystemCallError, TranscriptionRuntimeError => e
+                    recovery_errors << "directory sync: #{e.message}"
+                  end
+                end
+
+                close_atomic_resources(
+                  [source, backup, temporary],
+                  recovery_errors,
+                  label: ->(handle) { handle.respond_to?(:path) ? handle.path : path }
+                )
+                if temporary_name
+                  begin
+                    bound.unlink(temporary_name, missing_ok: true)
+                  rescue SystemCallError, TranscriptionRuntimeError => e
+                    temporary_path = bound.display_path(temporary_name)
+                    recovery_errors << "cleanup #{temporary_path}: #{e.message}"
+                  end
+                end
+                if backup_name && !retained_backups.include?(bound.display_path(backup_name))
+                  begin
+                    bound.unlink(backup_name, missing_ok: true)
+                    backup_name = nil
+                  rescue SystemCallError, TranscriptionRuntimeError => e
+                    backup_path = bound.display_path(backup_name)
+                    retained_backups << backup_path
+                    recovery_errors << "cleanup #{backup_path}: #{e.message}"
+                  end
                 end
               end
-            end
-            raise e
-          ensure
-            Thread.handle_interrupt(DEFERRED_PUBLICATION_EXCEPTIONS) do
-              cleanup_failure = nil
-              cleanup_operations = [
-                -> { temporary&.close unless temporary&.closed? },
-                -> { backup&.close unless backup&.closed? },
-                -> { bound.unlink(temporary_name, missing_ok: true) if temporary_name },
-                lambda do
-                  bound.unlink(backup_name, missing_ok: true) if backup_name && !preserved_backup
-                end
-              ]
-              cleanup_operations.each do |operation|
-                operation.call
-              rescue SystemCallError, IOError => e
-                cleanup_failure ||= e
-              end
-              raise cleanup_failure if cleanup_failure && !primary_failed &&
-                                       Thread.current.status != "aborting"
             end
           end
+        rescue Exception => e # rubocop:disable Lint/RescueException -- retain failures outside the bound block
+          primary_error ||= e
+          raise
+        ensure
+          finish_atomic_recovery!(
+            subject: "State commit",
+            completed: completed,
+            primary_error: primary_error,
+            recovery_errors: recovery_errors,
+            retained_backups: retained_backups
+          )
         end
       end
 

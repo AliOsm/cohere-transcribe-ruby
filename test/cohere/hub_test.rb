@@ -402,7 +402,7 @@ module Cohere
 
           assert_equal new_commit, hub.resolve_revision("owner/model", "main")
           assert_equal new_commit, ref.read.strip
-          assert_equal (ref.dirname.stat.mode & 0o666) | 0o600, ref.stat.mode & 0o777
+          assert_equal 0o644, ref.stat.mode & 0o777
         ensure
           ref&.chmod(0o600) if ref&.exist?
         end
@@ -420,7 +420,7 @@ module Cohere
 
           ref = refs.join("main")
           assert_equal commit, ref.read.strip
-          assert_equal 0o660, ref.stat.mode & 0o777
+          assert_equal 0o640, ref.stat.mode & 0o777
           assert_empty Dir.glob(repository.join("*.ref.lock").to_s)
         end
       end
@@ -445,7 +445,7 @@ module Cohere
             assert_equal 0o2770, path.stat.mode & 0o2777, path.to_s
           end
           assert_equal commit, ref.read
-          assert_equal 0o660, ref.stat.mode & 0o777
+          assert_equal 0o640, ref.stat.mode & 0o777
         end
       end
 
@@ -467,9 +467,285 @@ module Cohere
 
           lock = hub.send(:download_lock_path, destination)
           assert_equal "shared payload", destination.read
-          assert_equal 0o660, destination.stat.mode & 0o777
+          assert_equal 0o640, destination.stat.mode & 0o777
           assert_equal 0o660, lock.stat.mode & 0o777
-          assert_equal 0o2770, destination.dirname.stat.mode & 0o2777
+          assert_equal 0o3770, destination.dirname.stat.mode & 0o3777
+        end
+      end
+
+      def test_world_writable_cache_uses_role_specific_modes
+        Dir.mktmpdir("cohere-hub-world-cache") do |directory|
+          cache = Pathname(directory).join("hub").tap(&:mkpath)
+          cache.chmod(0o777)
+          commit = "7" * 40
+          hub = Hub.new(cache_dir: cache, endpoint: "https://example.invalid")
+          hub.define_singleton_method(:request) do |_uri, stream: nil, **_options|
+            stream.write("immutable payload")
+          end
+
+          destination = hub.download("owner/model", "weights.bin", revision: commit)
+          hub.send(:write_ref, "owner/model", "main", commit)
+
+          repository = cache.join("models--owner--model")
+          refs = repository.join("refs")
+          assert_equal 0o1777, repository.stat.mode & 0o3777
+          assert_equal 0o1777, destination.dirname.stat.mode & 0o3777
+          assert_equal 0o777, refs.stat.mode & 0o3777
+          assert_equal 0o644, destination.stat.mode & 0o777
+          assert_equal 0o644, refs.join("main").stat.mode & 0o777
+          assert_equal 0o666, hub.send(:download_lock_path, destination).stat.mode & 0o777
+        end
+      end
+
+      def test_cache_modes_do_not_cross_a_directory_without_execute_access
+        Dir.mktmpdir("cohere-hub-mode-gating") do |directory|
+          parent = Pathname(directory).join("parent").tap(&:mkpath)
+          parent.chmod(0o760)
+          hub = Hub.new(cache_dir: directory)
+
+          assert_equal 0o700, hub.send(:cache_directory_mode, parent)
+          assert_equal 0o600, hub.send(:cache_payload_mode, parent)
+          assert_equal 0o600, hub.send(:cache_lock_mode, parent)
+        end
+      end
+
+      def test_cache_mode_updates_tolerate_filesystems_without_mode_changes
+        hub = Hub.new
+        errors = %i[EPERM EROFS EOPNOTSUPP ENOTSUP].filter_map do |name|
+          Errno.const_get(name) if Errno.const_defined?(name)
+        end
+
+        errors.each do |error_class|
+          target = Object.new
+          target.define_singleton_method(:chmod) { |_mode| raise error_class, "unsupported mode change" }
+          assert_nil hub.send(:apply_cache_mode_if_supported, target, 0o660), error_class.name
+        end
+
+        target = Object.new
+        target.define_singleton_method(:chmod) { |_mode| raise Errno::EIO, "broken mount" }
+        assert_raises(Errno::EIO) { hub.send(:apply_cache_mode_if_supported, target, 0o660) }
+      end
+
+      def test_current_owned_cache_files_are_upgraded_for_shared_use
+        Dir.mktmpdir("cohere-hub-owned-modes") do |directory|
+          commit = "7" * 40
+          repository = Pathname(directory).join("models--owner--model").tap(&:mkpath)
+          repository.chmod(0o770)
+          snapshot = repository.join("snapshots", commit).tap(&:mkpath)
+          refs = repository.join("refs").tap(&:mkpath)
+          snapshot.chmod(0o770)
+          refs.chmod(0o770)
+          payload = snapshot.join("weights.bin").tap { |path| path.write("cached") }
+          ref = refs.join("main").tap { |path| path.write(commit) }
+          lock = snapshot.join("download.lock").tap { |path| path.write("existing") }
+          [payload, ref, lock].each { |path| path.chmod(0o600) }
+          hub = Hub.new(cache_dir: directory, endpoint: "https://example.invalid")
+          hub.define_singleton_method(:request) { |*_args, **_options| flunk "cached payload must not be fetched" }
+
+          assert_equal payload, hub.download("owner/model", "weights.bin", revision: commit)
+          assert_equal commit, hub.send(:write_ref, "owner/model", "main", commit)
+          hub.send(:open_cache_lock, lock, purpose: "Hub download") { |_handle| nil }
+
+          assert_equal 0o640, payload.stat.mode & 0o777
+          assert_equal 0o640, ref.stat.mode & 0o777
+          assert_equal 0o660, lock.stat.mode & 0o777
+          assert_equal 0o1770, repository.stat.mode & 0o3777
+        end
+      end
+
+      def test_cached_download_upgrades_current_owned_shared_directories_without_a_write
+        Dir.mktmpdir("cohere-hub-owned-cached-path") do |directory|
+          commit = "7" * 40
+          repository = Pathname(directory).join("models--owner--model")
+          snapshot_root = repository.join("snapshots")
+          snapshot = snapshot_root.join(commit).tap(&:mkpath)
+          [repository, snapshot_root, snapshot].each { |path| path.chmod(0o770) }
+          payload = snapshot.join("weights.bin").tap { |path| path.write("cached") }
+          payload.chmod(0o600)
+          hub = Hub.new(cache_dir: directory, endpoint: "https://example.invalid")
+          hub.define_singleton_method(:request) { |*_args, **_options| flunk "cached payload must not be fetched" }
+
+          assert_equal payload, hub.download("owner/model", "weights.bin", revision: commit)
+
+          [repository, snapshot_root, snapshot].each do |path|
+            assert_equal 0o1770, path.stat.mode & 0o3777, path.to_s
+          end
+          assert_equal 0o640, payload.stat.mode & 0o777
+        end
+      end
+
+      def test_cached_download_does_not_mutate_an_unowned_read_only_cache
+        Dir.mktmpdir("cohere-hub-unowned-cached-path") do |directory|
+          commit = "7" * 40
+          repository = Pathname(directory).join("models--owner--model")
+          snapshot_root = repository.join("snapshots")
+          snapshot = snapshot_root.join(commit).tap(&:mkpath)
+          payload = snapshot.join("weights.bin").tap { |path| path.write("cached") }
+          [repository, snapshot_root, snapshot].each { |path| path.chmod(0o550) }
+          payload.chmod(0o440)
+          hub = Hub.new(cache_dir: directory, endpoint: "https://example.invalid")
+          hub.define_singleton_method(:cache_file_owned_by_current_process?) { |_stat| false }
+          hub.define_singleton_method(:request) { |*_args, **_options| flunk "cached payload must not be fetched" }
+
+          assert_equal payload, hub.download("owner/model", "weights.bin", revision: commit)
+
+          [repository, snapshot_root, snapshot].each do |path|
+            assert_equal 0o550, path.stat.mode & 0o3777, path.to_s
+          end
+          assert_equal 0o440, payload.stat.mode & 0o777
+        ensure
+          [repository, snapshot_root, snapshot].compact.each do |path|
+            path.chmod(0o700) if path.exist?
+          end
+          payload&.chmod(0o600) if payload&.exist?
+        end
+      end
+
+      def test_readable_shared_download_lock_can_be_used_read_only
+        Dir.mktmpdir("cohere-hub-readonly-lock") do |directory|
+          path = Pathname(directory).join("download.lock").tap { |lock| lock.write("existing") }
+          path.chmod(0o440)
+          hub = Hub.new(cache_dir: directory)
+          hub.define_singleton_method(:cache_file_owned_by_current_process?) { |_stat| false }
+
+          hub.send(:open_cache_lock, path, purpose: "Hub download") do |lock|
+            assert_raises(IOError) { lock.write("not writable") }
+            assert lock.flock(File::LOCK_EX | File::LOCK_NB)
+            lock.flock(File::LOCK_UN)
+          end
+        ensure
+          path&.chmod(0o600) if path&.exist?
+        end
+      end
+
+      def test_writable_lock_reopen_closes_the_descriptor_after_an_identity_race
+        Dir.mktmpdir("cohere-hub-lock-reopen-race") do |directory|
+          path = Pathname(directory).join("download.lock").tap { |lock| lock.write("existing") }
+          hub = Hub.new(cache_dir: directory)
+          captured = nil
+          closes = 0
+          hub.define_singleton_method(:verify_cache_lock_identity!) do |_path, handle, purpose:|
+            captured = handle
+            original_close = handle.method(:close)
+            handle.define_singleton_method(:close) do
+              closes += 1
+              original_close.call
+            end
+            raise Hub::Error, "#{purpose} lock changed during the fixture race"
+          end
+
+          assert_raises(Hub::Error) do
+            hub.send(:reopen_cache_lock_writable, path, purpose: "Hub download")
+          end
+          assert_predicate captured, :closed?
+          assert_equal 1, closes
+        end
+      end
+
+      def test_readonly_to_writable_lock_handoff_closes_both_handles_when_killed
+        Dir.mktmpdir("cohere-hub-lock-reopen-kill") do |directory|
+          path = Pathname(directory).join("download.lock").tap { |lock| lock.write("existing") }
+          path.chmod(0o400)
+          hub = Hub.new(cache_dir: directory)
+          close_started = Queue.new
+          readonly = nil
+          replacement = nil
+          readonly_close_calls = 0
+          replacement_close_calls = 0
+          original_verify = hub.method(:verify_cache_lock_identity!)
+          hub.define_singleton_method(:verify_cache_lock_identity!) do |candidate, handle, purpose:|
+            result = original_verify.call(candidate, handle, purpose: purpose)
+            if readonly.nil?
+              readonly = handle
+              original_close = handle.method(:close)
+              handle.define_singleton_method(:close) do
+                readonly_close_calls += 1
+                if readonly_close_calls == 1
+                  close_started << true
+                  sleep
+                end
+                original_close.call unless closed?
+              end
+            else
+              replacement = handle
+              original_close = handle.method(:close)
+              handle.define_singleton_method(:close) do
+                replacement_close_calls += 1
+                original_close.call unless closed?
+              end
+            end
+            result
+          end
+          worker = Thread.new do
+            hub.send(:open_cache_lock_handle, path, purpose: "Hub download", mode: 0o600)
+          end
+          worker.report_on_exception = false
+          Timeout.timeout(2) { close_started.pop }
+
+          worker.kill
+
+          assert worker.join(2), "cache-lock handoff did not finish after termination"
+          assert_predicate readonly, :closed?
+          assert_predicate replacement, :closed?
+          assert_equal 2, readonly_close_calls
+          assert_equal 1, replacement_close_calls
+        ensure
+          worker&.kill
+          worker&.join
+          path&.chmod(0o600) if path&.exist?
+        end
+      end
+
+      def test_unreadable_existing_download_lock_fails_with_remediation
+        Dir.mktmpdir("cohere-hub-unreadable-lock") do |directory|
+          path = Pathname(directory).join("download.lock").tap { |lock| lock.write("existing") }
+          path.chmod(0o000)
+          hub = Hub.new(cache_dir: directory)
+
+          error = assert_raises(Hub::Error) do
+            hub.send(:open_cache_lock, path, purpose: "Hub download") { flunk "lock must not open" }
+          end
+
+          assert_match(/not readable/, error.message)
+          assert_match(%r{grant shared read/write access}, error.message)
+          assert path.file?
+          path.chmod(0o600)
+          assert_equal "existing", File.binread(path)
+        ensure
+          path&.chmod(0o600) if path&.exist?
+        end
+      end
+
+      def test_readonly_lock_flock_failures_are_typed
+        hub = Hub.new
+        errors = [Errno::EBADF, Errno::ENOLCK]
+        errors << Errno::EOPNOTSUPP if Errno.const_defined?(:EOPNOTSUPP)
+
+        errors.each do |error_class|
+          lock = Object.new
+          lock.define_singleton_method(:flock) { |_operation| raise error_class, "fixture lock failure" }
+          error = assert_raises(Hub::Error, error_class.name) do
+            hub.send(:acquire_download_lock!, lock, Pathname("download.lock"), Pathname("weights.bin"))
+          end
+          assert_instance_of error_class, error.cause
+        end
+      end
+
+      def test_oversized_ref_is_rejected_and_rewritten_without_reuse
+        Dir.mktmpdir("cohere-hub-oversized-ref") do |directory|
+          cached_commit = cache_snapshot(directory)
+          replacement = "9" * 40
+          ref = Pathname(directory).join("models--owner--model/refs/main")
+          ref.open("ab") { |file| file.truncate(1024 * 1024) }
+          hub = Hub.new(cache_dir: directory, offline: true)
+
+          assert_nil hub.send(:read_ref_commit, ref)
+          assert_raises(Hub::Error) { hub.resolve_revision("owner/model", "main") }
+
+          hub.send(:write_ref, "owner/model", "main", replacement)
+          assert_equal replacement, ref.read
+          assert_equal 40, ref.size
+          refute_equal cached_commit, ref.read
         end
       end
 

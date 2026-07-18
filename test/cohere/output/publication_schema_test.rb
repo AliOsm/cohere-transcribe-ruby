@@ -548,14 +548,18 @@ module Cohere
             destination = Pathname(directory).join("clip.txt")
             destination.binwrite("old transcript")
 
-            error = assert_raises(Errno::EIO) do
+            error = assert_raises(TranscriptionRuntimeError) do
               Publication.atomic_write_set(
                 { "txt" => destination },
                 { "txt" => "new transcript" }
               )
             end
 
+            assert_match(/cleanup was incomplete/, error.message)
             assert_match(/backup cleanup failure/, error.message)
+            retained = destination.dirname.children.select { |path| path.extname == ".bak" }
+            assert_equal 1, retained.length
+            assert_includes error.message, retained.fetch(0).to_s
             assert_equal "new transcript", destination.binread
           end
         ensure
@@ -595,15 +599,137 @@ module Cohere
           State::BoundDirectory.define_method(:unlink, original_unlink) if original_unlink
         end
 
-        def test_directory_fsync_is_best_effort_when_the_filesystem_rejects_it
-          original_open = File.method(:open)
-          errors = [Errno::EACCES, Errno::EBADF, Errno::EINVAL, Errno::EISDIR, Errno::ENOTSUP, Errno::EPERM]
-          errors.each do |error|
-            File.define_singleton_method(:open) { |*| raise error, "directory fsync unsupported" }
-            Publication.send(:fsync_directories, [Pathname("/virtual/output")])
+        def test_atomic_writer_aggregates_every_directory_close_failure_and_preserves_the_primary_failure
+          original_close = State::BoundDirectory.instance_method(:close)
+          closed = []
+          State::BoundDirectory.define_method(:close) do
+            closed << binding.canonical_path
+            original_close.bind_call(self)
+            raise Errno::EIO, "forced output directory close failure"
+          end
+
+          Dir.mktmpdir("cohere-output-close") do |directory|
+            root = Pathname(directory)
+            first_parent = root.join("first")
+            second_parent = root.join("second")
+            first_parent.mkdir
+            second_parent.mkdir
+            first = first_parent.join("clip.txt")
+            second = second_parent.join("clip.json")
+
+            error = assert_raises(TranscriptionRuntimeError) do
+              Publication.atomic_write_set(
+                { "txt" => first, "json" => second },
+                { "txt" => "new transcript", "json" => "{}" },
+                directory_bindings: [
+                  State::DirectoryBinding.capture(first_parent),
+                  State::DirectoryBinding.capture(second_parent)
+                ],
+                operation_hook: lambda do |phase, _path|
+                  raise "forced output primary failure" if phase == :before_stage_write
+                end
+              )
+            end
+
+            assert_equal [first_parent.realpath, second_parent.realpath].sort, closed.sort
+            assert_equal 2, error.message.scan("forced output directory close failure").length
+            assert_instance_of RuntimeError, error.cause
+            assert_equal "forced output primary failure", error.cause.message
+            assert_empty first_parent.children
+            assert_empty second_parent.children
           end
         ensure
-          File.define_singleton_method(:open, original_open) if original_open
+          State::BoundDirectory.define_method(:close, original_close) if original_close
+        end
+
+        def test_successful_output_rollback_does_not_clean_the_restored_backup_again
+          original_unlink = State::BoundDirectory.instance_method(:unlink)
+          backup_cleanup_attempts = []
+          State::BoundDirectory.define_method(:unlink) do |name, missing_ok: false|
+            backup_cleanup_attempts << name if name.end_with?(".bak")
+            original_unlink.bind_call(self, name, missing_ok: missing_ok)
+          end
+
+          Dir.mktmpdir("cohere-output-restored-backup") do |directory|
+            destination = Pathname(directory).join("clip.txt")
+            destination.binwrite("old transcript")
+
+            error = assert_raises(RuntimeError) do
+              Publication.atomic_write_set(
+                { "txt" => destination },
+                { "txt" => "new transcript" },
+                operation_hook: lambda do |phase, _path|
+                  raise "forced failure after rename" if phase == :after_rename
+                end
+              )
+            end
+
+            assert_equal "forced failure after rename", error.message
+            assert_equal "old transcript", destination.binread
+            assert_empty backup_cleanup_attempts
+            transaction_files = destination.dirname.children.select do |path|
+              %w[.tmp .bak].include?(path.extname)
+            end
+            assert_empty transaction_files
+          end
+        ensure
+          State::BoundDirectory.define_method(:unlink, original_unlink) if original_unlink
+        end
+
+        def test_output_backup_copy_closes_both_handles_and_types_the_first_close_failure
+          original_open = State::BoundDirectory.instance_method(:open_regular)
+          original_create = State::BoundDirectory.instance_method(:create_temporary)
+          source_opens = 0
+          close_calls = Hash.new(0)
+          State::BoundDirectory.define_method(:open_regular) do |name, writable: false|
+            handle = original_open.bind_call(self, name, writable: writable)
+            source_opens += 1 if name == "clip.txt"
+            if name == "clip.txt" && source_opens == 2
+              close = handle.method(:close)
+              handle.define_singleton_method(:close) do
+                close_calls[:source] += 1
+                raise Errno::EIO, "forced output source close failure" if close_calls[:source] == 1
+
+                close.call
+              end
+            end
+            handle
+          end
+          State::BoundDirectory.define_method(:create_temporary) do |basename, suffix|
+            name, handle = original_create.bind_call(self, basename, suffix)
+            if suffix == ".bak"
+              close = handle.method(:close)
+              handle.define_singleton_method(:close) do
+                close_calls[:backup] += 1
+                close.call
+              end
+            end
+            [name, handle]
+          end
+
+          Dir.mktmpdir("cohere-output-copy-close") do |directory|
+            destination = Pathname(directory).join("clip.txt")
+            destination.binwrite("old transcript")
+
+            error = assert_raises(TranscriptionRuntimeError) do
+              Publication.atomic_write_set(
+                { "txt" => destination },
+                { "txt" => "new transcript" }
+              )
+            end
+
+            assert_match(/close .*forced output source close failure/, error.message)
+            assert_instance_of Errno::EIO, error.cause
+            assert_equal({ source: 2, backup: 1 }, close_calls)
+            assert_equal "old transcript", destination.binread
+            transaction_files = destination.dirname.children.select do |path|
+              %w[.tmp .bak].include?(path.extname)
+            end
+            assert_empty transaction_files
+          end
+        ensure
+          State::BoundDirectory.define_method(:open_regular, original_open) if original_open
+          State::BoundDirectory.define_method(:create_temporary, original_create) if original_create
         end
 
         def test_atomic_writer_restores_every_committed_output_after_a_later_failure

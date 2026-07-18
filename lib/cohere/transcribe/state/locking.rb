@@ -2,6 +2,7 @@
 
 require "digest"
 require "fileutils"
+require "rubygems/version"
 require "tmpdir"
 
 module Cohere
@@ -155,6 +156,7 @@ module Cohere
                     "Output lock was released before committing #{target.identity}"
             end
 
+            canonical_held = @roles.include?(:canonical)
             @keys.zip(@handles, @roles).each do |path, handle, role|
               State.verify_lock_identity!(
                 path,
@@ -164,7 +166,7 @@ module Cohere
             rescue TranscriptionRuntimeError => e
               # The output-adjacent lock is authoritative. A tmp cleaner may
               # remove the 0.1.x compatibility path; replacement is still fatal.
-              raise unless role == :legacy && State.missing_lock_path_error?(e)
+              raise unless canonical_held && role == :legacy && State.missing_lock_path_error?(e)
             end
           end
           nil
@@ -255,10 +257,8 @@ module Cohere
         paths.freeze
       end
 
-      def legacy_lock_compatibility_enabled?
-        current = VERSION.split(".").first(3).map(&:to_i)
-        removal = LEGACY_LOCK_REMOVAL_VERSION.split(".").first(3).map(&:to_i)
-        (current <=> removal).negative?
+      def legacy_lock_compatibility_enabled?(version = VERSION)
+        Gem::Version.new(version) < Gem::Version.new(LEGACY_LOCK_REMOVAL_VERSION)
       end
 
       def canonical_lock_path(identity)
@@ -351,7 +351,10 @@ module Cohere
         stat = path.lstat
         raise TranscriptionRuntimeError, "Output lock directory is not a real directory: #{path}" unless stat.directory? && !stat.symlink?
 
-        return if shared
+        if shared
+          validate_shared_lock_directory_mode!(path, stat)
+          return
+        end
         return if Gem.win_platform?
 
         if Process.respond_to?(:uid) && stat.uid != Process.uid
@@ -379,10 +382,22 @@ module Cohere
           apply_lock_mode_if_supported(path, mode)
         rescue Errno::EEXIST
           existing = path.lstat
-          apply_lock_mode_if_supported(path, mode) if !Gem.win_platform? && existing.directory? && (existing.mode & 0o3777) != mode
+          owned = Process.respond_to?(:uid) && existing.uid == Process.uid
+          mode_can_be_updated = !Gem.win_platform? && existing.directory? && owned
+          apply_lock_mode_if_supported(path, mode) if mode_can_be_updated && (existing.mode & 0o3777) != mode
         rescue SystemCallError => e
           raise TranscriptionRuntimeError, "Cannot prepare output lock directory #{path}: #{e.message}"
         end
+      end
+
+      def validate_shared_lock_directory_mode!(path, stat)
+        return if Gem.win_platform? || !Process.respond_to?(:uid)
+        return if stat.uid == Process.uid
+        return if stat.mode.nobits?(0o022) || stat.mode.anybits?(0o1000)
+
+        raise TranscriptionRuntimeError,
+              "Output lock directory is writable by multiple users but has no sticky bit: #{path}. " \
+              "Ask its owner or administrator to add the sticky bit, or remove it when no transcription job is running"
       end
 
       def shared_lock_file_mode(directory_stat)
@@ -506,7 +521,7 @@ module Cohere
         current = Pathname(path).lstat
         return opened if opened.file? && same_file?(opened, current)
 
-        raise TranscriptionRuntimeError, "#{message}: #{path}"
+        raise TranscriptionRuntimeError, "#{message}: #{path}", cause: nil
       rescue SystemCallError => e
         raise TranscriptionRuntimeError, "#{message}: #{path}", cause: e
       end

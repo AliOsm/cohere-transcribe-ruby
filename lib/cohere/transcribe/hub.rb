@@ -20,12 +20,17 @@ module Cohere
       class NotFoundError < Error; end
 
       COMMIT_PATTERN = /\A[0-9a-f]{40}\z/i
+      REF_READ_LIMIT = 41
       DEFAULT_ENDPOINT = "https://huggingface.co"
       RESOLUTION_MEMO_TTL_SECONDS = 5.0
       RESOLUTION_MEMO_LIMIT = 64
+      CACHE_MODE_UNSUPPORTED_ERRNOS = %i[EPERM EROFS EOPNOTSUPP ENOTSUP].filter_map do |name|
+        Errno.const_get(name)::Errno if Errno.const_defined?(name)
+      end.freeze
       ResolutionMemo = Struct.new(:value, :error, :expires_at, keyword_init: true)
 
-      private_constant :RESOLUTION_MEMO_TTL_SECONDS, :RESOLUTION_MEMO_LIMIT, :ResolutionMemo
+      private_constant :REF_READ_LIMIT, :RESOLUTION_MEMO_TTL_SECONDS, :RESOLUTION_MEMO_LIMIT,
+                       :CACHE_MODE_UNSUPPORTED_ERRNOS, :ResolutionMemo
 
       attr_reader :cache_dir, :endpoint
 
@@ -77,7 +82,10 @@ module Cohere
         commit = resolve_revision(repo_id, revision, filename: filename)
         repository = cache_dir.join(cache_repo_name(repo_id))
         destination = repository.join("snapshots", commit, filename)
-        return destination if safe_cached_file(repository, destination)
+        if (cached = safe_cached_file(repository, destination))
+          normalize_cached_payload(repository, cached)
+          return cached
+        end
 
         prepare_cache_directory!(repository, destination.dirname)
         encoded_repo = repo_id.split("/").map { |part| URI.encode_www_form_component(part) }.join("/")
@@ -85,14 +93,17 @@ module Cohere
         uri = URI("#{endpoint}/#{encoded_repo}/resolve/#{commit}/#{encoded_filename}")
 
         open_download_lock(download_lock_path(destination)) do |lock|
-          raise Error, "Cannot acquire Hub download lock for #{destination}" unless lock.flock(File::LOCK_EX)
+          acquire_download_lock!(lock, download_lock_path(destination), destination)
 
           verify_cache_lock_identity!(
             download_lock_path(destination),
             lock,
             purpose: "Hub download"
           )
-          return destination if safe_cached_file(repository, destination)
+          if (cached = safe_cached_file(repository, destination))
+            normalize_cached_payload(repository, cached)
+            return cached
+          end
 
           cleanup_download_temporaries(destination)
           Tempfile.create(
@@ -100,7 +111,7 @@ module Cohere
             destination.dirname.to_s,
             binmode: true
           ) do |temporary|
-            temporary.chmod(cache_file_mode(destination.dirname))
+            apply_cache_mode_if_supported(temporary, cache_payload_mode(destination.dirname))
             request(uri, stream: temporary)
             temporary.flush
             temporary.fsync
@@ -341,11 +352,24 @@ module Cohere
         candidates = []
         ref = revision_path(repository, revision)
         cached_ref = safe_cached_file(repository, ref)
-        candidates << cached_ref.read.strip if cached_ref
+        candidates << read_ref_commit(cached_ref) if cached_ref
         candidates << revision if COMMIT_PATTERN.match?(revision)
         candidates.find do |candidate|
           COMMIT_PATTERN.match?(candidate) &&
             safe_cached_file(repository, repository.join("snapshots", candidate, filename))
+        end
+      rescue SystemCallError
+        nil
+      end
+
+      def read_ref_commit(path)
+        File.open(path, "rb") do |ref|
+          next if ref.stat.size > REF_READ_LIMIT
+
+          value = ref.read(REF_READ_LIMIT)&.strip
+          next if ref.stat.size > REF_READ_LIMIT
+
+          value if value && COMMIT_PATTERN.match?(value)
         end
       rescue SystemCallError
         nil
@@ -362,22 +386,19 @@ module Cohere
       def write_ref(repo_id, revision, commit)
         repository = cache_dir.join(cache_repo_name(repo_id))
         path = revision_path(repository, revision)
-        prepare_cache_directory!(repository, repository)
+        prepare_cache_directory!(repository, path.dirname, replaceable_entries: true)
         current = safe_cached_file(repository, path)
-        begin
-          return commit if current && current.read == commit
-        rescue SystemCallError
-          # A shared cache can contain a ref written with another user's
-          # private umask. Try replacing it through the writable parent.
+        if current && read_ref_commit(current) == commit
+          normalize_cached_file_mode(current, cache_payload_mode(current.dirname))
+          return commit
         end
 
-        prepare_cache_directory!(repository, path.dirname)
         # Standard Hub refs contain only the immutable commit. Concurrent
         # writers may replace one complete hint with another, while Tempfile
         # and rename ensure readers never observe a partial value.
         Tempfile.create([".cohere-transcribe-ref-", ".tmp"], path.dirname.to_s) do |temporary|
           temporary.write(commit)
-          temporary.chmod(cache_file_mode(path.dirname))
+          apply_cache_mode_if_supported(temporary, cache_payload_mode(path.dirname))
           temporary.flush
           temporary.fsync
           temporary.close
@@ -420,7 +441,7 @@ module Cohere
         pattern = destination.dirname.join("#{download_temporary_prefix(destination)}*.download")
         Dir.glob(pattern.to_s).each do |path|
           File.unlink(path)
-        rescue Errno::ENOENT
+        rescue Errno::ENOENT, Errno::EACCES, Errno::EPERM, Errno::EROFS
           nil
         end
       end
@@ -430,29 +451,144 @@ module Cohere
       end
 
       def open_cache_lock(path, purpose:)
-        flags = File::RDWR | File::CREAT
-        flags |= File::NOFOLLOW if defined?(File::NOFOLLOW)
-        flags |= File::CLOEXEC if defined?(File::CLOEXEC)
-        descriptor = ::IO.sysopen(path.to_s, flags, 0o600)
-        lock = File.new(descriptor, "r+", autoclose: true)
-        descriptor = nil
-        verify_cache_lock_identity!(path, lock, purpose: purpose)
-        desired_mode = cache_file_mode(path.dirname)
-        opened = lock.stat
-        lock.chmod(desired_mode) if opened.uid == Process.euid && (opened.mode & 0o777) != desired_mode
+        path = Pathname(path)
+        desired_mode = cache_lock_mode(path.dirname)
+        lock, access, created = open_cache_lock_handle(path, purpose: purpose, mode: desired_mode)
+        opened = verify_cache_lock_identity!(path, lock, purpose: purpose)
+        owned_writable = access == "r+" && cache_file_owned_by_current_process?(opened)
+        apply_cache_mode_if_supported(lock, desired_mode) if (created || owned_writable) && (opened.mode & 0o777) != desired_mode
 
         yield lock
       rescue Errno::ELOOP, Errno::EISDIR, Errno::ENXIO => e
         raise Error, "#{purpose} lock is not a regular file: #{path}", cause: e
       ensure
         lock&.close
+      end
+
+      def open_cache_lock_handle(path, purpose:, mode:)
+        descriptor = nil
+        handle = nil
+        replacement = nil
+        retired = nil
+        succeeded = false
+        begin
+          descriptor, created = open_or_create_cache_lock_descriptor(path, cache_lock_flags, mode)
+          access = "r+"
+        rescue Errno::EACCES, Errno::EROFS => e
+          descriptor = open_readonly_cache_lock_descriptor(path, purpose: purpose, write_error: e)
+          created = false
+          access = "r"
+        end
+
+        handle = File.new(descriptor, access, autoclose: true)
+        descriptor = nil
+        opened = verify_cache_lock_identity!(path, handle, purpose: purpose)
+        if access == "r" && cache_file_owned_by_current_process?(opened)
+          apply_cache_mode_if_supported(handle, mode)
+          replacement = reopen_cache_lock_writable(path, purpose: purpose)
+          if replacement
+            retired = handle
+            handle = replacement
+            replacement = nil
+            access = "r+"
+            retired.close
+            retired = nil
+          end
+        end
+        succeeded = true
+        [handle, access, created]
+      rescue Errno::ELOOP, Errno::EISDIR, Errno::ENXIO => e
+        raise Error, "#{purpose} lock is not a regular file: #{path}", cause: e
+      ensure
+        retired.close if retired && !retired.closed?
+        replacement.close if replacement && !replacement.closed?
+        handle.close if handle && !succeeded && !handle.closed?
         ::IO.new(descriptor).close if descriptor
+      end
+
+      def open_or_create_cache_lock_descriptor(path, flags, mode)
+        2.times do
+          return [::IO.sysopen(path.to_s, flags, mode), false]
+        rescue Errno::ENOENT
+          begin
+            return [::IO.sysopen(path.to_s, flags | File::CREAT | File::EXCL, mode), true]
+          rescue Errno::EEXIST
+            next
+          end
+        end
+
+        raise Errno::ENOENT, path.to_s
+      end
+
+      def open_readonly_cache_lock_descriptor(path, purpose:, write_error:)
+        ::IO.sysopen(path.to_s, readonly_cache_lock_flags)
+      rescue Errno::EACCES => e
+        raise Error,
+              "#{purpose} lock is not readable at #{path}; ask the cache owner to grant shared read/write access, " \
+              "or remove the stale lock only after all downloads have stopped",
+              cause: e
+      rescue Errno::ENOENT => e
+        raise Error, "Cannot create #{purpose.downcase} lock at #{path}: #{write_error.message}", cause: e
+      end
+
+      def reopen_cache_lock_writable(path, purpose:)
+        handle = nil
+        succeeded = false
+        descriptor = ::IO.sysopen(path.to_s, cache_lock_flags)
+        handle = File.new(descriptor, "r+", autoclose: true)
+        descriptor = nil
+        verify_cache_lock_identity!(path, handle, purpose: purpose)
+        succeeded = true
+        handle
+      rescue Errno::EACCES, Errno::EROFS
+        nil
+      ensure
+        handle&.close unless succeeded
+        ::IO.new(descriptor).close if descriptor
+      end
+
+      def cache_lock_flags
+        flags = File::RDWR
+        flags |= File::NOFOLLOW if defined?(File::NOFOLLOW)
+        flags |= File::CLOEXEC if defined?(File::CLOEXEC)
+        flags
+      end
+
+      def readonly_cache_lock_flags
+        flags = File::RDONLY
+        flags |= File::NOFOLLOW if defined?(File::NOFOLLOW)
+        flags |= File::CLOEXEC if defined?(File::CLOEXEC)
+        flags
+      end
+
+      def acquire_download_lock!(lock, path, destination)
+        return if lock.flock(File::LOCK_EX)
+
+        raise Error, "Cannot acquire Hub download lock for #{destination} at #{path}"
+      rescue SystemCallError => e
+        if e.is_a?(Errno::EBADF)
+          detail = "the filesystem requires a writable shared lock file"
+        elsif cache_locking_unsupported?(e)
+          detail = "the filesystem does not provide the required file locking"
+        else
+          raise
+        end
+        raise Error, "Cannot acquire Hub download lock for #{destination}: #{detail} at #{path}", cause: e
+      end
+
+      def cache_locking_unsupported?(error)
+        names = %i[ENOLCK EOPNOTSUPP ENOTSUP]
+        names.any? { |name| Errno.const_defined?(name) && error.errno == Errno.const_get(name)::Errno }
+      end
+
+      def cache_file_owned_by_current_process?(stat)
+        Process.respond_to?(:euid) && stat.uid == Process.euid
       end
 
       def verify_cache_lock_identity!(path, lock, purpose:)
         opened = lock.stat
         current = path.lstat
-        return if opened.file? && !current.symlink? && opened.dev == current.dev && opened.ino == current.ino
+        return opened if opened.file? && !current.symlink? && opened.dev == current.dev && opened.ino == current.ino
 
         raise Error, "#{purpose} lock changed while held or is not a regular file: #{path}"
       rescue SystemCallError => e
@@ -462,13 +598,13 @@ module Cohere
       # Build each repository subdirectory only after proving that its parent is
       # still inside this repository. This prevents a poisoned snapshots/refs
       # symlink from redirecting a Tempfile and rename outside the cache.
-      def prepare_cache_directory!(repository, directory)
+      def prepare_cache_directory!(repository, directory, replaceable_entries: false)
         FileUtils.mkdir_p(cache_dir)
         cache_root = cache_dir.realpath
         begin
           create_cache_directory(repository, cache_dir)
         rescue Errno::EEXIST
-          nil
+          normalize_existing_cache_directory(repository, replaceable_entries: false)
         end
 
         repository_stat = repository.lstat
@@ -489,9 +625,9 @@ module Cohere
 
           current = current.join(part)
           begin
-            create_cache_directory(current, current.dirname)
+            create_cache_directory(current, current.dirname, replaceable_entries: replaceable_entries)
           rescue Errno::EEXIST
-            nil
+            normalize_existing_cache_directory(current, replaceable_entries: replaceable_entries)
           end
           resolved = current.realpath
           unless resolved.directory? && within_directory?(resolved, repository_root)
@@ -505,11 +641,11 @@ module Cohere
         raise Error, "Cannot prepare Hub cache directory #{directory}: #{e.message}"
       end
 
-      def create_cache_directory(path, parent)
+      def create_cache_directory(path, parent, replaceable_entries: false)
         # New cache directories inherit the verified parent's ordinary access
         # bits and setgid policy even when this process has a private umask.
         # Owner access keeps a newly-created private cache usable.
-        mode = (parent.stat.mode & 0o2777) | 0o700
+        mode = cache_directory_mode(parent, replaceable_entries: replaceable_entries)
         Dir.mkdir(path, mode)
         flags = File::RDONLY
         flags |= File::NOFOLLOW if defined?(File::NOFOLLOW)
@@ -521,12 +657,115 @@ module Cohere
             raise Error, "Hub cache directory changed while it was being created: #{path}"
           end
 
-          handle.chmod(mode)
+          apply_cache_mode_if_supported(handle, mode)
         end
       end
 
-      def cache_file_mode(parent)
-        (parent.stat.mode & 0o666) | 0o600
+      def normalize_existing_cache_directory(path, replaceable_entries:)
+        return if replaceable_entries
+
+        flags = File::RDONLY
+        flags |= File::NOFOLLOW if defined?(File::NOFOLLOW)
+        flags |= File::CLOEXEC if defined?(File::CLOEXEC)
+        File.open(path, flags) do |handle|
+          opened = handle.stat
+          current = path.lstat
+          unless opened.directory? && !current.symlink? && opened.dev == current.dev && opened.ino == current.ino
+            raise Error, "Hub cache directory changed while its mode was being updated: #{path}"
+          end
+          next unless cache_file_owned_by_current_process?(opened)
+
+          current_mode = opened.mode & 0o3777
+          desired_mode = current_mode | (current_mode.anybits?(0o022) ? 0o1000 : 0)
+          apply_cache_mode_if_supported(handle, desired_mode) if current_mode != desired_mode
+        end
+      rescue Errno::EACCES, Errno::EROFS, Errno::ENOENT, Errno::ELOOP
+        nil
+      end
+
+      def normalize_cached_file_mode(path, desired_mode)
+        return if path.lstat.symlink?
+
+        flags = File::RDONLY
+        flags |= File::NOFOLLOW if defined?(File::NOFOLLOW)
+        flags |= File::CLOEXEC if defined?(File::CLOEXEC)
+        File.open(path, flags) do |handle|
+          opened = handle.stat
+          current = path.lstat
+          unless opened.file? && !current.symlink? && opened.dev == current.dev && opened.ino == current.ino
+            raise Error, "Hub cache file changed while its mode was being updated: #{path}"
+          end
+          next unless cache_file_owned_by_current_process?(opened)
+          next if (opened.mode & 0o777) == desired_mode
+
+          apply_cache_mode_if_supported(handle, desired_mode)
+        end
+      rescue Errno::EACCES, Errno::EROFS, Errno::ENOENT, Errno::ELOOP
+        nil
+      end
+
+      def normalize_cached_payload(repository, path)
+        repository_root = repository.realpath
+        relative = path.dirname.relative_path_from(repository)
+        return if relative.absolute? || relative.each_filename.any? { |part| part == ".." }
+
+        current = repository
+        normalize_existing_cache_directory(current, replaceable_entries: false)
+        components = relative.each_filename.reject { |part| part == "." }
+        until components.empty?
+          part = components.shift
+
+          current = current.join(part)
+          resolved = current.realpath
+          return unless resolved.directory? && within_directory?(resolved, repository_root)
+
+          normalize_existing_cache_directory(current, replaceable_entries: false)
+        end
+        normalize_cached_file_mode(path, cache_payload_mode(path.dirname))
+      rescue Error, SystemCallError, ArgumentError
+        # Reusing a verified immutable payload does not depend on being able to
+        # upgrade access modes in an older or read-only cache.
+        nil
+      end
+
+      def cache_directory_mode(parent, replaceable_entries: false)
+        parent_mode = parent.stat.mode
+        mode = 0o700 | (parent_mode & 0o2000)
+        mode |= parent_mode & 0o070 if parent_mode.anybits?(0o010)
+        mode |= parent_mode & 0o007 if parent_mode.anybits?(0o001)
+        # Snapshot directories keep other users from replacing published
+        # payloads. Ref directories omit this bit so collaborators can replace
+        # one another's advisory branch hints through atomic rename.
+        mode |= 0o1000 if !replaceable_entries && mode.anybits?(0o022)
+        mode
+      end
+
+      def cache_payload_mode(parent)
+        # Published payloads and refs inherit read access, never collaborator
+        # write access. Ref replacement is provided by the parent directory.
+        parent_mode = parent.stat.mode
+        mode = 0o600
+        mode |= 0o040 if parent_mode.allbits?(0o050)
+        mode |= 0o004 if parent_mode.allbits?(0o005)
+        mode
+      end
+
+      def cache_lock_mode(parent)
+        # Lock files must be writable by every collaborator who can create
+        # cache entries in the containing directory.
+        parent_mode = parent.stat.mode
+        mode = 0o600
+        mode |= 0o060 if parent_mode.allbits?(0o030)
+        mode |= 0o006 if parent_mode.allbits?(0o003)
+        mode
+      end
+
+      def apply_cache_mode_if_supported(target, mode)
+        target.chmod(mode)
+      rescue SystemCallError => e
+        raise unless CACHE_MODE_UNSUPPORTED_ERRNOS.include?(e.errno)
+
+        nil
       end
 
       def within_directory?(path, directory)

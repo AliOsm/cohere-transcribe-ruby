@@ -572,7 +572,7 @@ module Cohere
           marker = root.join("marker.json")
           source.binwrite("audio")
 
-          error = assert_raises(Errno::EIO) do
+          error = assert_raises(TranscriptionRuntimeError) do
             State.write_state_atomic(
               marker,
               { "kind" => "new" },
@@ -582,6 +582,7 @@ module Cohere
             )
           end
 
+          assert_match(/cleanup was incomplete/, error.message)
           assert_match(/temporary cleanup failed/, error.message)
           assert_equal "new", JSON.parse(marker.read).dig("payload", "kind")
         end
@@ -595,7 +596,7 @@ module Cohere
           source.binwrite("audio")
           primary_failure = Class.new(StandardError)
 
-          error = assert_raises(primary_failure) do
+          error = assert_raises(TranscriptionRuntimeError) do
             State.write_state_atomic(
               marker,
               { "kind" => "new" },
@@ -608,7 +609,10 @@ module Cohere
             )
           end
 
-          assert_equal "primary state write failed", error.message
+          assert_match(/recovery was incomplete/, error.message)
+          assert_match(/temporary cleanup failed/, error.message)
+          assert_instance_of primary_failure, error.cause
+          assert_equal "primary state write failed", error.cause.message
           refute marker.exist?
         end
       end
@@ -857,7 +861,7 @@ module Cohere
             )
           end
 
-          assert_match(/rollback was incomplete/, error.message)
+          assert_match(/recovery was incomplete/, error.message)
           retained = error.message.match(/preserved backup: (.+)\z/).captures.fetch(0)
           assert File.file?(retained), "reported backup was removed: #{retained}"
           assert_equal "old state", File.binread(retained)
@@ -1166,6 +1170,31 @@ module Cohere
         end
       ensure
         State.define_singleton_method(:apply_lock_mode_if_supported, original_apply_mode) if original_apply_mode
+      end
+
+      def test_output_lock_rejects_an_unowned_writable_non_sticky_shared_registry
+        skip "ownership and mode bits are unavailable" if Gem.win_platform? || !Process.respond_to?(:uid)
+
+        stat = Struct.new(:uid, :mode).new(Process.uid + 1, 0o040770)
+        path = Pathname("/shared/.cohere-transcribe-locks")
+
+        error = assert_raises(TranscriptionRuntimeError) do
+          State.validate_shared_lock_directory_mode!(path, stat)
+        end
+        assert_match(/writable by multiple users/, error.message)
+        assert_match(/sticky bit/, error.message)
+        assert_match(/owner or administrator/, error.message)
+      end
+
+      def test_output_lock_accepts_an_unowned_sticky_shared_registry
+        skip "ownership and mode bits are unavailable" if Gem.win_platform? || !Process.respond_to?(:uid)
+
+        stat = Struct.new(:uid, :mode).new(Process.uid + 1, 0o041770)
+
+        assert_nil State.validate_shared_lock_directory_mode!(
+          Pathname("/shared/.cohere-transcribe-locks"),
+          stat
+        )
       end
 
       def test_output_lock_upgrades_a_preexisting_shared_registry_with_a_sticky_bit
@@ -1769,11 +1798,57 @@ module Cohere
         end
       end
 
+      def test_missing_single_legacy_lock_invalidates_the_lock
+        skip "open files cannot be unlinked" if Gem.win_platform?
+
+        Dir.mktmpdir("cohere-single-legacy-lock") do |directory|
+          path = Pathname(directory).join("legacy.lock")
+          path.binwrite("")
+          File.open(path, "r+") do |handle|
+            handle.flock(File::LOCK_EX)
+            target = State::OutputLockTarget.new(path: path, identity: "legacy-only")
+            lock = State::OutputSetLock.new(target, [handle], [path], roles: [:legacy])
+            path.delete
+
+            error = assert_raises(TranscriptionRuntimeError) { lock.verify! }
+            assert_instance_of Errno::ENOENT, error.cause
+          ensure
+            lock&.release
+          end
+        end
+      end
+
+      def test_replaced_lock_does_not_inherit_an_unrelated_active_exception_as_its_cause
+        Dir.mktmpdir("cohere-lock-explicit-cause") do |directory|
+          path = Pathname(directory).join("output.lock")
+          path.binwrite("")
+          File.open(path, "r+") do |handle|
+            parked = path.sub_ext(".parked")
+            path.rename(parked)
+            path.binwrite("")
+
+            begin
+              raise Errno::ENOENT, "unrelated failure"
+            rescue Errno::ENOENT
+              error = assert_raises(TranscriptionRuntimeError) do
+                State.verify_lock_identity!(path, handle, message: "Output lock changed")
+              end
+            end
+
+            assert_nil error.cause
+            refute State.missing_lock_path_error?(error)
+          end
+        end
+      end
+
       def test_legacy_lock_compatibility_has_an_enforced_version_sunset
         removal = State.const_get(:LEGACY_LOCK_REMOVAL_VERSION, false)
 
         assert_equal "0.2.0", removal
         assert State.legacy_lock_compatibility_enabled?, "remove the legacy lock before #{removal}"
+        assert State.legacy_lock_compatibility_enabled?("0.2.0.rc1")
+        refute State.legacy_lock_compatibility_enabled?("0.2.0")
+        refute State.legacy_lock_compatibility_enabled?("0.2.1")
       end
 
       def test_signal_during_lock_acquisition_closes_and_unlocks_the_descriptor
