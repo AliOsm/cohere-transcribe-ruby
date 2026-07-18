@@ -983,7 +983,7 @@ module Cohere
             staged&.each_value do |bound, name|
               bound.unlink(name, missing_ok: true)
             rescue SystemCallError, TranscriptionRuntimeError => e
-              cleanup_errors << e
+              cleanup_errors << [bound.display_path(name), e]
             end
             backups&.each_value do |backup|
               next unless backup && !preserved_backups&.key?(backup)
@@ -991,23 +991,40 @@ module Cohere
               bound, name = backup
               bound.unlink(name, missing_ok: true)
             rescue SystemCallError, TranscriptionRuntimeError => e
-              cleanup_errors << e
+              preserved_backups[backup] = true
+              cleanup_errors << [bound.display_path(name), e]
             end
             open_handles&.each { |handle| handle.close unless handle.closed? }
             bound_directories&.each_value(&:close)
-            if rollback_errors.any? && primary_error
-              detail = rollback_errors.join("; ")
+            recovery_errors = rollback_errors + cleanup_errors.map do |path, error|
+              "cleanup #{path}: #{error.message}"
+            end
+            # Thread#kill and nonlocal throw/return unwinds run this ensure
+            # without entering the rescue above. In that case completed is the
+            # authoritative signal that a failed recovery must replace the
+            # otherwise silent unwind with an actionable typed error.
+            if recovery_errors.any? && !completed && primary_error.nil?
+              detail = recovery_errors.join("; ")
               retained = preserved_backups.keys.filter_map do |backup|
                 backup&.then { |bound, name| bound.display_path(name).to_s }
               end.sort
               raise TranscriptionRuntimeError,
-                    "Output commit failed and rollback was incomplete (#{detail}); " \
+                    "Output commit did not complete and recovery was incomplete (#{detail}); " \
+                    "preserved backups: #{retained}"
+            end
+            if recovery_errors.any? && primary_error
+              detail = recovery_errors.join("; ")
+              retained = preserved_backups.keys.filter_map do |backup|
+                backup&.then { |bound, name| bound.display_path(name).to_s }
+              end.sort
+              raise TranscriptionRuntimeError,
+                    "Output commit failed and recovery was incomplete (#{detail}); " \
                     "preserved backups: #{retained}",
                     cause: primary_error
             end
             if cleanup_errors.any? && completed && primary_error.nil? &&
                Thread.current.status != "aborting"
-              raise cleanup_errors.first
+              raise cleanup_errors.first.last
             end
           end
         end

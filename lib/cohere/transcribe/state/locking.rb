@@ -68,7 +68,7 @@ module Cohere
                 State.refresh_legacy_lock(handle) if lock_path.legacy?
               end
 
-              lock = new(target, handles, keys)
+              lock = new(target, handles, keys, roles: lock_paths.map(&:role))
               keys.each do |key|
                 active[key] = lock
               end
@@ -140,10 +140,11 @@ module Cohere
 
         attr_reader :target
 
-        def initialize(target, handles, keys)
+        def initialize(target, handles, keys, roles: nil)
           @target = target
           @handles = handles.freeze
           @keys = keys.freeze
+          @roles = (roles || Array.new(keys.length, :primary)).freeze
           @released = false
         end
 
@@ -154,12 +155,16 @@ module Cohere
                     "Output lock was released before committing #{target.identity}"
             end
 
-            @keys.zip(@handles).each do |path, handle|
+            @keys.zip(@handles, @roles).each do |path, handle, role|
               State.verify_lock_identity!(
                 path,
                 handle,
                 message: "Output lock changed while held for #{target.identity}"
               )
+            rescue TranscriptionRuntimeError => e
+              # The output-adjacent lock is authoritative. A tmp cleaner may
+              # remove the 0.1.x compatibility path; replacement is still fatal.
+              raise unless role == :legacy && State.missing_lock_path_error?(e)
             end
           end
           nil
@@ -246,8 +251,14 @@ module Cohere
         # then, acquiring both paths keeps released 0.1.2 processes coordinated
         # with output-adjacent locks.
         paths = [LockPath.new(path: primary.freeze, role: :canonical)]
-        paths << LockPath.new(path: legacy.freeze, role: :legacy) if VERSION.start_with?("0.1.") && legacy != primary
+        paths << LockPath.new(path: legacy.freeze, role: :legacy) if legacy_lock_compatibility_enabled? && legacy != primary
         paths.freeze
+      end
+
+      def legacy_lock_compatibility_enabled?
+        current = VERSION.split(".").first(3).map(&:to_i)
+        removal = LEGACY_LOCK_REMOVAL_VERSION.split(".").first(3).map(&:to_i)
+        (current <=> removal).negative?
       end
 
       def canonical_lock_path(identity)
@@ -368,25 +379,10 @@ module Cohere
           apply_lock_mode_if_supported(path, mode)
         rescue Errno::EEXIST
           existing = path.lstat
-          if !Gem.win_platform? && Process.respond_to?(:uid) && existing.directory? &&
-             existing.uid == Process.uid && (existing.mode & 0o3777) != mode
-            apply_lock_mode_if_supported(path, mode)
-          end
+          apply_lock_mode_if_supported(path, mode) if !Gem.win_platform? && existing.directory? && (existing.mode & 0o3777) != mode
         rescue SystemCallError => e
           raise TranscriptionRuntimeError, "Cannot prepare output lock directory #{path}: #{e.message}"
         end
-        validate_shared_lock_directory_mode!(path)
-      end
-
-      def validate_shared_lock_directory_mode!(path)
-        return if Gem.win_platform?
-
-        stat = path.lstat
-        return unless stat.mode.anybits?(0o022)
-        return if stat.mode.anybits?(0o1000)
-
-        raise TranscriptionRuntimeError,
-              "Shared output lock directory must use the sticky bit: #{path}"
       end
 
       def shared_lock_file_mode(directory_stat)
@@ -478,6 +474,10 @@ module Cohere
       # pending_interrupt? is already false while ensure blocks are running.
       def lock_acquisition_unwinding?
         Thread.current.status == "aborting"
+      end
+
+      def missing_lock_path_error?(error)
+        error.cause.is_a?(Errno::ENOENT)
       end
 
       def inspect_lock_path!(path)

@@ -2,6 +2,9 @@
 
 require "test_helper"
 require "fiddle"
+require "open3"
+require "rbconfig"
+require "shellwords"
 require "tmpdir"
 require "timeout"
 
@@ -166,6 +169,129 @@ module Cohere
             "RIFF", 36 + data_bytes, "WAVE", "fmt ", 16, 1, 1,
             SAMPLE_RATE, SAMPLE_RATE * 2, 2, 16, "data", data_bytes
           ].pack("a4Va4a4VvvVVvva4V")
+        end
+      end
+
+      class FFmpegNativeLegacyAdapterTest < Minitest::Test
+        def test_adapter_without_the_optional_version_symbol_still_decodes_and_probes_duration
+          Dir.mktmpdir("cohere-legacy-audio-adapter") do |directory|
+            library = FFmpegNative::Library.new(build_legacy_adapter(directory))
+
+            assert_same library, library.probe!
+            assert_equal "legacy adapter", library.diagnostic
+            assert_nil library.ffmpeg_versions
+            assert_nil library.avutil_major
+            assert_in_delta 2.5, library.duration("fixture.wav"), 1e-9
+
+            samples = library.decode(
+              "fixture.wav",
+              sample_rate: SAMPLE_RATE,
+              max_decoded_bytes: 2 * Fiddle::SIZEOF_FLOAT
+            )
+            assert_equal 2, samples.length
+            assert_in_delta 0.25, samples[0], 1e-6
+            assert_in_delta(-0.5, samples[1], 1e-6)
+          end
+        end
+
+        def test_present_version_symbol_failure_still_rejects_the_adapter
+          library = fake_probe_library(versions: ->(_tuple, _count) { 1 })
+
+          error = assert_raises(TranscriptionRuntimeError) { library.probe! }
+          assert_match(/did not report their version tuple/, error.message)
+        end
+
+        def test_present_version_symbol_with_an_invalid_tuple_still_rejects_the_adapter
+          versions = lambda do |tuple, _count|
+            tuple[0, 4 * Fiddle::SIZEOF_INT] = [60, 60, 0, 4].pack("i!4")
+            0
+          end
+          library = fake_probe_library(versions: versions)
+
+          error = assert_raises(TranscriptionRuntimeError) { library.probe! }
+          assert_match(/invalid version tuple/, error.message)
+        end
+
+        private
+
+        def fake_probe_library(versions:)
+          probe = lambda do |diagnostic, _capacity|
+            diagnostic[0, 3] = "ok\0"
+            0
+          end
+          FFmpegNative::Library.allocate.tap do |library|
+            library.instance_variable_set(:@functions, { probe: probe, versions: versions }.freeze)
+          end
+        end
+
+        def build_legacy_adapter(directory)
+          unless RbConfig::CONFIG.fetch("host_os").match?(/linux|darwin/)
+            skip "legacy adapter compilation is only supported on Linux and macOS"
+          end
+
+          source = File.join(directory, "legacy_audio.c")
+          library = File.join(directory, "libcohere_audio_legacy.#{RbConfig::CONFIG.fetch("DLEXT")}")
+          File.write(source, <<~C)
+            #include <stdint.h>
+            #include <stddef.h>
+            #include <stdlib.h>
+            #include <string.h>
+
+            int cohere_audio_ffmpeg_probe(char *diagnostic, size_t capacity) {
+              const char message[] = "legacy adapter";
+              if (diagnostic && capacity) {
+                size_t length = sizeof(message) < capacity ? sizeof(message) : capacity;
+                memcpy(diagnostic, message, length);
+                diagnostic[capacity - 1] = '\\0';
+              }
+              return 0;
+            }
+
+            int cohere_audio_ffmpeg_decode(
+              const char *path,
+              int target_rate,
+              uint64_t maximum_bytes,
+              float **output_samples,
+              int64_t *output_count,
+              char *diagnostic,
+              size_t capacity
+            ) {
+              (void)path;
+              (void)target_rate;
+              (void)diagnostic;
+              (void)capacity;
+              if (!output_samples || !output_count || (maximum_bytes && maximum_bytes < 2 * sizeof(float))) return 4;
+              float *samples = malloc(2 * sizeof(float));
+              if (!samples) return 5;
+              samples[0] = 0.25f;
+              samples[1] = -0.5f;
+              *output_samples = samples;
+              *output_count = 2;
+              return 0;
+            }
+
+            int cohere_audio_ffmpeg_duration(
+              const char *path,
+              double *output_duration,
+              char *diagnostic,
+              size_t capacity
+            ) {
+              (void)path;
+              (void)diagnostic;
+              (void)capacity;
+              if (!output_duration) return 2;
+              *output_duration = 2.5;
+              return 0;
+            }
+
+            void cohere_audio_ffmpeg_cancel(void) {}
+            void cohere_audio_ffmpeg_free(void *samples) { free(samples); }
+          C
+          command = Shellwords.split(RbConfig::CONFIG.fetch("LDSHARED"))
+          output, status = Open3.capture2e(*command, source, "-o", library)
+          skip "could not compile the legacy adapter fixture: #{output}" unless status.success?
+
+          library
         end
       end
 

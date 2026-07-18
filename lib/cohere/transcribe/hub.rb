@@ -24,20 +24,8 @@ module Cohere
       RESOLUTION_MEMO_TTL_SECONDS = 5.0
       RESOLUTION_MEMO_LIMIT = 64
       ResolutionMemo = Struct.new(:value, :error, :expires_at, keyword_init: true)
-      ResolutionState = Struct.new(
-        :publication_guard,
-        :next_sequence,
-        :active,
-        :published_sequence,
-        :published_value,
-        keyword_init: true
-      )
-      RefSnapshot = Data.define(:commit, :device, :inode, :size, :mtime_ns, :ctime_ns)
-      ResolutionTicket = Struct.new(:key, :state, :sequence, :observed_ref, keyword_init: true)
-      UNCONDITIONAL_REF_WRITE = Object.new.freeze
 
-      private_constant :RESOLUTION_MEMO_TTL_SECONDS, :RESOLUTION_MEMO_LIMIT, :ResolutionMemo,
-                       :ResolutionState, :RefSnapshot, :ResolutionTicket, :UNCONDITIONAL_REF_WRITE
+      private_constant :RESOLUTION_MEMO_TTL_SECONDS, :RESOLUTION_MEMO_LIMIT, :ResolutionMemo
 
       attr_reader :cache_dir, :endpoint
 
@@ -54,7 +42,6 @@ module Cohere
                    end
         @resolution_guard = Mutex.new
         @resolution_memo = {}
-        @resolution_states = {}
       end
 
       def offline?
@@ -113,6 +100,7 @@ module Cohere
             destination.dirname.to_s,
             binmode: true
           ) do |temporary|
+            temporary.chmod(cache_file_mode(destination.dirname))
             request(uri, stream: temporary)
             temporary.flush
             temporary.fsync
@@ -122,7 +110,7 @@ module Cohere
           sync_directory(destination.dirname)
         end
         destination
-      rescue Errno::EACCES, Errno::ENOSPC, Errno::EROFS => e
+      rescue SystemCallError => e
         raise Error, "Cannot cache #{repo_id}/#{filename}: #{e.message}"
       end
 
@@ -134,10 +122,16 @@ module Cohere
         siblings = payload.is_a?(Hash) ? payload["siblings"] : nil
         raise Error, "Hub returned no repository file list for #{repo_id}@#{commit}" unless siblings.is_a?(Array)
 
-        siblings.filter_map do |item|
+        files = siblings.filter_map do |item|
           name = item.is_a?(Hash) ? item["rfilename"] : nil
-          name if name.is_a?(String)
-        end.freeze
+          name if name.is_a?(String) && !name.empty?
+        end
+        if files.empty?
+          detail = siblings.empty? ? "an empty repository file list" : "no valid repository file entries"
+          raise Error, "Hub returned #{detail} for #{repo_id}@#{commit}"
+        end
+
+        files.freeze
       rescue JSON::ParserError => e
         raise TransientError, "Invalid Hub response while listing #{repo_id.inspect}: #{e.message}"
       end
@@ -169,28 +163,29 @@ module Cohere
 
       def resolve_online_revision(repo_id, revision)
         key = resolution_key(repo_id, revision)
-        Thread.handle_interrupt(Object => :never) do
-          memo, ticket = claim_resolution(key, repo_id, revision)
-          return resolution_value(memo.value, memo.error) if memo
-
-          # Concurrent misses deliberately perform independent requests. The
-          # first successful publication becomes the shared result for this
-          # client's brief memo window. Per-key publication sequencing prevents
-          # a response from an older request replacing a newer published ref
-          # even when that response arrives after the memo has expired.
-          begin
-            value = Thread.handle_interrupt(Object => :immediate) do
-              fetch_online_revision(repo_id, revision)
-            end
-            Thread.handle_interrupt(Object => :immediate) do
-              publish_resolution(ticket, repo_id, revision, value)
-            end
-          rescue TransientError => e
-            publish_resolution_error(ticket, e)
-          ensure
-            finish_resolution(ticket)
-          end
+        memo = @resolution_guard.synchronize do
+          prune_resolution_memo
+          @resolution_memo[key]
         end
+        return resolution_value(memo.value, memo.error) if memo
+
+        # Concurrent misses deliberately perform independent requests. Each
+        # caller uses the response it fetched; the short memo only avoids
+        # repeated requests that begin after one lookup has completed.
+        value = fetch_online_revision(repo_id, revision)
+        write_ref_best_effort(repo_id, revision, value)
+        @resolution_guard.synchronize { memoize_resolution(key, value, nil) }
+        value
+      rescue TransientError => e
+        memo = @resolution_guard.synchronize do
+          prune_resolution_memo
+          current = @resolution_memo[key]
+          memoize_resolution(key, nil, e) unless current
+          current
+        end
+        return resolution_value(memo.value, memo.error) if memo
+
+        raise
       end
 
       def fetch_online_revision(repo_id, revision)
@@ -200,108 +195,12 @@ module Cohere
         payload = JSON.parse(response.body.to_s)
         commit = payload.is_a?(Hash) ? payload["sha"] : nil
         unless commit.is_a?(String) && COMMIT_PATTERN.match?(commit)
-          raise Error, "Hub returned no immutable commit for #{repo_id.inspect} at #{revision.inspect}"
+          raise TransientError, "Hub returned no immutable commit for #{repo_id.inspect} at #{revision.inspect}"
         end
 
         commit.downcase
       rescue JSON::ParserError => e
         raise TransientError, "Invalid Hub response while resolving #{repo_id.inspect}: #{e.message}"
-      end
-
-      def claim_resolution(key, repo_id, revision)
-        memo = @resolution_guard.synchronize do
-          prune_resolution_memo
-          @resolution_memo[key]
-        end
-        return [memo, nil] if memo
-
-        observed_ref = Thread.handle_interrupt(Object => :immediate) do
-          capture_ref_snapshot(repo_id, revision)
-        end
-        Thread.handle_interrupt(Object => :never) do
-          @resolution_guard.synchronize do
-            prune_resolution_memo
-            memo = @resolution_memo[key]
-            return [memo, nil] if memo
-
-            state = @resolution_states[key] ||= ResolutionState.new(
-              publication_guard: Mutex.new,
-              next_sequence: 0,
-              active: 0,
-              published_sequence: nil,
-              published_value: nil
-            )
-            state.next_sequence += 1
-            state.active += 1
-            ticket = ResolutionTicket.new(
-              key: key,
-              state: state,
-              sequence: state.next_sequence,
-              observed_ref: observed_ref
-            )
-            [nil, ticket]
-          end
-        end
-      end
-
-      def publish_resolution(ticket, repo_id, revision, value)
-        ticket.state.publication_guard.synchronize do
-          published = @resolution_guard.synchronize do
-            prune_resolution_memo
-            memo = @resolution_memo[ticket.key]
-            if memo && !memo.error
-              memo.value
-            elsif ticket.state.published_sequence && ticket.sequence < ticket.state.published_sequence
-              ticket.state.published_value
-            end
-          end
-          return published if published
-
-          # Ref preparation and synchronization stay interruptible and outside
-          # the instance-wide memo mutex. The observed-ref check remains the
-          # authority if termination lands after rename but before this
-          # instance records the completed value.
-          authoritative = write_ref(
-            repo_id,
-            revision,
-            value,
-            expected_snapshot: ticket.observed_ref
-          )
-          Thread.handle_interrupt(Object => :never) do
-            @resolution_guard.synchronize do
-              ticket.state.published_sequence = ticket.sequence
-              ticket.state.published_value = authoritative
-              memoize_resolution(ticket.key, authoritative, nil)
-            end
-            value = authoritative
-          end
-        end
-        value
-      end
-
-      def publish_resolution_error(ticket, error)
-        @resolution_guard.synchronize do
-          prune_resolution_memo
-          memo = @resolution_memo[ticket.key]
-          return resolution_value(memo.value, memo.error) if memo
-          return ticket.state.published_value if ticket.state.published_sequence &&
-                                                 ticket.sequence < ticket.state.published_sequence
-
-          memoize_resolution(ticket.key, nil, error)
-        end
-        raise error
-      end
-
-      def finish_resolution(ticket)
-        Thread.handle_interrupt(Object => :never) do
-          @resolution_guard.synchronize do
-            ticket.state.active -= 1
-            return unless ticket.state.active.zero?
-            return unless @resolution_states[ticket.key].equal?(ticket.state)
-
-            @resolution_states.delete(ticket.key)
-          end
-        end
       end
 
       def memoize_resolution(key, value, error)
@@ -452,109 +351,40 @@ module Cohere
         nil
       end
 
-      def write_ref(repo_id, revision, commit, expected_snapshot: UNCONDITIONAL_REF_WRITE)
-        repository = cache_dir.join(cache_repo_name(repo_id))
-        path = revision_path(repository, revision)
-        prepare_cache_directory!(repository, repository)
-        lock_path = ref_publication_lock_path(repository, revision)
-        open_cache_lock(lock_path, purpose: "Hub reference publication") do |lock|
-          raise Error, "Cannot acquire Hub reference publication lock for #{path}" unless lock.flock(File::LOCK_EX)
-
-          verify_cache_lock_identity!(lock_path, lock, purpose: "Hub reference publication")
-          current = capture_ref_snapshot(repo_id, revision)
-          unless expected_snapshot.equal?(UNCONDITIONAL_REF_WRITE) || current == expected_snapshot
-            return current.commit if current&.commit
-
-            raise TransientError,
-                  "Hub reference changed while resolving #{repo_id.inspect} at #{revision.inspect}"
-          end
-          return commit if current&.commit == commit
-
-          prepare_cache_directory!(repository, path.dirname)
-          # Each writer publishes a complete immutable commit from its own
-          # temporary file. The retained lock and observed-ref comparison keep
-          # a response that started from an older cache view from replacing a
-          # ref already published by another Hub instance or process.
-          Tempfile.create([".cohere-transcribe-ref-", ".tmp"], path.dirname.to_s) do |temporary|
-            temporary.write("#{commit}\n")
-            temporary.flush
-            temporary.fsync
-            temporary.close
-            verify_cache_lock_identity!(lock_path, lock, purpose: "Hub reference publication")
-            File.rename(temporary.path, path)
-            verify_cache_lock_identity!(lock_path, lock, purpose: "Hub reference publication")
-          end
-          sync_directory(path.dirname)
-          verify_cache_lock_identity!(lock_path, lock, purpose: "Hub reference publication")
-        end
+      def write_ref_best_effort(repo_id, revision, commit)
+        write_ref(repo_id, revision, commit)
+      rescue Error, SystemCallError
+        # Hub refs are advisory cache hints. A valid online response remains
+        # usable when a shared or read-only cache cannot publish the hint.
         commit
       end
 
-      def capture_ref_snapshot(repo_id, revision)
+      def write_ref(repo_id, revision, commit)
         repository = cache_dir.join(cache_repo_name(repo_id))
         path = revision_path(repository, revision)
-        path = safe_cached_file(repository, path)
-        return nil unless path
-
-        3.times do
-          handle = nil
-          begin
-            flags = File::RDONLY
-            flags |= File::NOFOLLOW if defined?(File::NOFOLLOW)
-            flags |= File::CLOEXEC if defined?(File::CLOEXEC)
-            descriptor = ::IO.sysopen(path.to_s, flags)
-            handle = File.new(descriptor, "r", autoclose: true)
-            descriptor = nil
-            opened = handle.stat
-            body = handle.read(256)
-            current = path.lstat
-            next unless opened.file? && !current.symlink? && opened.dev == current.dev && opened.ino == current.ino
-
-            text = body.to_s.strip
-            commit = text.downcase if COMMIT_PATTERN.match?(text)
-            return RefSnapshot.new(
-              commit: commit,
-              device: opened.dev,
-              inode: opened.ino,
-              size: opened.size,
-              mtime_ns: stat_nanoseconds(opened.mtime),
-              ctime_ns: stat_nanoseconds(opened.ctime)
-            )
-          rescue Errno::ENOENT
-            return nil
-          rescue Errno::ELOOP, Errno::EISDIR, Errno::ENXIO
-            begin
-              current = path.lstat
-            rescue Errno::ENOENT
-              next
-            end
-            return RefSnapshot.new(
-              commit: nil,
-              device: current.dev,
-              inode: current.ino,
-              size: current.size,
-              mtime_ns: stat_nanoseconds(current.mtime),
-              ctime_ns: stat_nanoseconds(current.ctime)
-            )
-          ensure
-            handle&.close
-            ::IO.new(descriptor).close if descriptor
-          end
+        prepare_cache_directory!(repository, repository)
+        current = safe_cached_file(repository, path)
+        begin
+          return commit if current && current.read == commit
+        rescue SystemCallError
+          # A shared cache can contain a ref written with another user's
+          # private umask. Try replacing it through the writable parent.
         end
 
-        raise TransientError,
-              "Hub reference changed repeatedly while resolving #{repo_id.inspect} at #{revision.inspect}"
-      rescue SystemCallError => e
-        raise Error, "Cannot inspect cached Hub reference #{path}: #{e.message}", cause: e
-      end
-
-      def ref_publication_lock_path(repository, revision)
-        digest = Digest::SHA256.hexdigest(revision)[0, 24]
-        repository.join(".cohere-transcribe-#{digest}.ref.lock")
-      end
-
-      def stat_nanoseconds(time)
-        (time.to_i * 1_000_000_000) + time.nsec
+        prepare_cache_directory!(repository, path.dirname)
+        # Standard Hub refs contain only the immutable commit. Concurrent
+        # writers may replace one complete hint with another, while Tempfile
+        # and rename ensure readers never observe a partial value.
+        Tempfile.create([".cohere-transcribe-ref-", ".tmp"], path.dirname.to_s) do |temporary|
+          temporary.write(commit)
+          temporary.chmod(cache_file_mode(path.dirname))
+          temporary.flush
+          temporary.fsync
+          temporary.close
+          File.rename(temporary.path, path)
+        end
+        sync_directory(path.dirname)
+        commit
       end
 
       def safe_cached_file(repository, path)
@@ -607,6 +437,9 @@ module Cohere
         lock = File.new(descriptor, "r+", autoclose: true)
         descriptor = nil
         verify_cache_lock_identity!(path, lock, purpose: purpose)
+        desired_mode = cache_file_mode(path.dirname)
+        opened = lock.stat
+        lock.chmod(desired_mode) if opened.uid == Process.euid && (opened.mode & 0o777) != desired_mode
 
         yield lock
       rescue Errno::ELOOP, Errno::EISDIR, Errno::ENXIO => e
@@ -633,7 +466,7 @@ module Cohere
         FileUtils.mkdir_p(cache_dir)
         cache_root = cache_dir.realpath
         begin
-          Dir.mkdir(repository, 0o755)
+          create_cache_directory(repository, cache_dir)
         rescue Errno::EEXIST
           nil
         end
@@ -656,7 +489,7 @@ module Cohere
 
           current = current.join(part)
           begin
-            Dir.mkdir(current, 0o755)
+            create_cache_directory(current, current.dirname)
           rescue Errno::EEXIST
             nil
           end
@@ -670,6 +503,30 @@ module Cohere
         raise
       rescue SystemCallError => e
         raise Error, "Cannot prepare Hub cache directory #{directory}: #{e.message}"
+      end
+
+      def create_cache_directory(path, parent)
+        # New cache directories inherit the verified parent's ordinary access
+        # bits and setgid policy even when this process has a private umask.
+        # Owner access keeps a newly-created private cache usable.
+        mode = (parent.stat.mode & 0o2777) | 0o700
+        Dir.mkdir(path, mode)
+        flags = File::RDONLY
+        flags |= File::NOFOLLOW if defined?(File::NOFOLLOW)
+        flags |= File::CLOEXEC if defined?(File::CLOEXEC)
+        File.open(path, flags) do |handle|
+          opened = handle.stat
+          current = path.lstat
+          unless opened.directory? && !current.symlink? && opened.dev == current.dev && opened.ino == current.ino
+            raise Error, "Hub cache directory changed while it was being created: #{path}"
+          end
+
+          handle.chmod(mode)
+        end
+      end
+
+      def cache_file_mode(parent)
+        (parent.stat.mode & 0o666) | 0o600
       end
 
       def within_directory?(path, directory)

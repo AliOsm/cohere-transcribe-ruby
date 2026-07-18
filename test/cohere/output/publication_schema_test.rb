@@ -562,7 +562,7 @@ module Cohere
           State::BoundDirectory.define_method(:unlink, original_unlink) if original_unlink
         end
 
-        def test_staging_cleanup_failure_does_not_replace_the_primary_write_failure
+        def test_staging_cleanup_failure_reports_the_primary_write_failure_as_its_cause
           original_unlink = State::BoundDirectory.instance_method(:unlink)
           State::BoundDirectory.define_method(:unlink) do |name, missing_ok: false|
             raise Errno::EIO, "simulated staging cleanup failure" if name.end_with?(".tmp")
@@ -573,7 +573,7 @@ module Cohere
           Dir.mktmpdir("cohere-output-primary") do |directory|
             destination = Pathname(directory).join("clip.txt")
 
-            error = assert_raises(RuntimeError) do
+            error = assert_raises(TranscriptionRuntimeError) do
               Publication.atomic_write_set(
                 { "txt" => destination },
                 { "txt" => "new transcript" },
@@ -583,7 +583,13 @@ module Cohere
               )
             end
 
-            assert_equal "simulated primary write failure", error.message
+            assert_match(/recovery was incomplete/, error.message)
+            assert_match(/simulated staging cleanup failure/, error.message)
+            assert_instance_of RuntimeError, error.cause
+            assert_equal "simulated primary write failure", error.cause.message
+            retained = Pathname(directory).children.select { |path| path.extname == ".tmp" }
+            assert_equal 1, retained.length
+            assert_includes error.message, retained.fetch(0).to_s
           end
         ensure
           State::BoundDirectory.define_method(:unlink, original_unlink) if original_unlink
@@ -685,6 +691,94 @@ module Cohere
             caller&.kill
             caller&.join
           end
+        end
+
+        def test_thread_kill_reports_an_incomplete_output_rollback_and_names_the_preserved_backup
+          original_rename = State::BoundDirectory.instance_method(:rename)
+          State::BoundDirectory.define_method(:rename) do |source, destination|
+            raise Errno::EIO, "forced restore failure" if source.end_with?(".bak")
+
+            original_rename.bind_call(self, source, destination)
+          end
+
+          Dir.mktmpdir("cohere-output-kill-rollback-failure") do |directory|
+            root = Pathname(directory)
+            destination = root.join("clip.txt")
+            destination.binwrite("old transcript")
+            hook = lambda do |phase, path|
+              next unless phase == :after_rename && path == destination
+
+              publishing_thread = Thread.current
+              Thread.new { publishing_thread.kill }.join
+            end
+            caller = Thread.new do
+              Publication.atomic_write_set(
+                { "txt" => destination },
+                { "txt" => "new transcript" },
+                operation_hook: hook
+              )
+            end
+            caller.report_on_exception = false
+
+            error = assert_raises(TranscriptionRuntimeError) do
+              Timeout.timeout(2) { caller.join }
+            end
+            assert_match(/recovery was incomplete/, error.message)
+            retained = root.children.select { |path| path.extname == ".bak" }
+            assert_equal 1, retained.length
+            assert_equal "old transcript", retained.fetch(0).binread
+            assert_includes error.message, retained.fetch(0).to_s
+            refute destination.exist?
+          ensure
+            caller&.kill
+            begin
+              caller&.join
+            rescue TranscriptionRuntimeError
+              nil
+            end
+          end
+        ensure
+          State::BoundDirectory.define_method(:rename, original_rename) if original_rename
+        end
+
+        def test_throw_reports_a_staging_cleanup_failure_instead_of_silently_leaving_the_file
+          original_unlink = State::BoundDirectory.instance_method(:unlink)
+          State::BoundDirectory.define_method(:unlink) do |name, missing_ok: false|
+            raise Errno::EIO, "forced staging cleanup failure" if name.end_with?(".tmp") && display_path(name).exist?
+
+            original_unlink.bind_call(self, name, missing_ok: missing_ok)
+          end
+
+          Dir.mktmpdir("cohere-output-throw-cleanup-failure") do |directory|
+            root = Pathname(directory)
+            first = root.join("first.txt")
+            second = root.join("second.txt")
+            first.binwrite("first-old")
+            second.binwrite("second-old")
+            hook = lambda do |phase, destination|
+              throw :stop_publication if phase == :after_rename && destination == first
+            end
+
+            error = assert_raises(TranscriptionRuntimeError) do
+              catch(:stop_publication) do
+                Publication.atomic_write_set(
+                  { "first" => first, "second" => second },
+                  { "first" => "first-new", "second" => "second-new" },
+                  operation_hook: hook
+                )
+              end
+            end
+
+            assert_match(/recovery was incomplete/, error.message)
+            assert_match(/forced staging cleanup failure/, error.message)
+            assert_equal "first-old", first.binread
+            assert_equal "second-old", second.binread
+            retained = root.children.select { |path| path.extname == ".tmp" }
+            assert_equal 1, retained.length
+            assert_includes error.message, retained.fetch(0).to_s
+          end
+        ensure
+          State::BoundDirectory.define_method(:unlink, original_unlink) if original_unlink
         end
 
         def test_thread_kill_during_failure_rollback_waits_for_cleanup
@@ -805,7 +899,7 @@ module Cohere
               )
             end
 
-            assert_match(/rollback was incomplete/, error.message)
+            assert_match(/recovery was incomplete/, error.message)
             retained = root.children.select { |path| path.extname == ".bak" }
             assert_equal 1, retained.length
             assert_equal "old transcript", retained.fetch(0).binread

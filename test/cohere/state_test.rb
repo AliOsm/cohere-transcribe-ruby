@@ -1136,28 +1136,57 @@ module Cohere
         end
       end
 
-      def test_output_lock_rejects_a_shared_writable_registry_without_a_sticky_bit
+      def test_output_lock_accepts_a_shared_registry_when_the_sticky_bit_cannot_be_persisted
         skip "mode bits are unavailable" if Gem.win_platform?
 
         original_apply_mode = State.method(:apply_lock_mode_if_supported)
         Dir.mktmpdir("cohere-lock-missing-sticky") do |directory|
+          mode_attempts = []
           output_parent = Pathname(directory).join("outputs")
           output_parent.mkdir
           output_parent.chmod(0o770)
           target = State.lock_target_for_outputs("txt" => output_parent.join("clip.txt"))
           target.path.dirname.mkdir(0o770)
           target.path.dirname.chmod(0o770)
-          State.define_singleton_method(:apply_lock_mode_if_supported) { |_target, _mode| nil }
-
-          error = assert_raises(TranscriptionRuntimeError) do
-            State::OutputSetLock.acquire(target)
+          State.define_singleton_method(:apply_lock_mode_if_supported) do |candidate, mode|
+            mode_attempts << [Pathname(candidate), mode]
           end
 
-          assert_match(/must use the sticky bit/, error.message)
+          lock = State::OutputSetLock.acquire(target)
+          begin
+            assert_equal 0o770, target.path.dirname.stat.mode & 0o1777
+            assert_includes mode_attempts, [target.path.dirname, 0o1770]
+            assert_equal 23, run_lock_child(target)
+            assert_nil lock.verify!
+          ensure
+            lock.release
+          end
           assert_empty State::OutputSetLock.active
+          assert_equal 0, run_lock_child(target)
         end
       ensure
         State.define_singleton_method(:apply_lock_mode_if_supported, original_apply_mode) if original_apply_mode
+      end
+
+      def test_output_lock_upgrades_a_preexisting_shared_registry_with_a_sticky_bit
+        skip "mode bits are unavailable" if Gem.win_platform?
+
+        Dir.mktmpdir("cohere-lock-upgrade-sticky") do |directory|
+          output_parent = Pathname(directory).join("outputs")
+          output_parent.mkdir
+          output_parent.chmod(0o770)
+          target = State.lock_target_for_outputs("txt" => output_parent.join("clip.txt"))
+          target.path.dirname.mkdir(0o770)
+          target.path.dirname.chmod(0o770)
+
+          lock = State::OutputSetLock.acquire(target)
+          begin
+            assert_equal 0o1770, target.path.dirname.stat.mode & 0o1777
+            assert_equal 23, run_lock_child(target)
+          ensure
+            lock.release
+          end
+        end
       end
 
       def test_output_lock_reconciles_an_owned_private_registry_for_a_shared_parent
@@ -1717,11 +1746,34 @@ module Cohere
         end
       end
 
+      def test_missing_legacy_lock_does_not_invalidate_the_held_canonical_lock
+        Dir.mktmpdir("cohere-held-legacy-lock") do |directory|
+          target = State.lock_target_for_outputs(
+            "txt" => Pathname(directory).join("clip.txt")
+          )
+          lock = State::OutputSetLock.acquire(target)
+          legacy_path = State.legacy_temporary_lock_path(target.identity)
+          legacy_path.delete
+
+          assert_nil lock.verify!
+          refute_predicate legacy_path, :exist?
+          assert_equal 23, run_lock_child(target)
+
+          legacy_path.binwrite("")
+          legacy_path.chmod(0o600) unless Gem.win_platform?
+          error = assert_raises(TranscriptionRuntimeError) { lock.verify! }
+          assert_match(/changed while held/, error.message)
+        ensure
+          lock&.release
+          legacy_path&.delete if legacy_path&.exist?
+        end
+      end
+
       def test_legacy_lock_compatibility_has_an_enforced_version_sunset
         removal = State.const_get(:LEGACY_LOCK_REMOVAL_VERSION, false)
 
         assert_equal "0.2.0", removal
-        assert_match(/\A0\.1\./, Cohere::Transcribe::VERSION, "remove the legacy lock before #{removal}")
+        assert State.legacy_lock_compatibility_enabled?, "remove the legacy lock before #{removal}"
       end
 
       def test_signal_during_lock_acquisition_closes_and_unlocks_the_descriptor

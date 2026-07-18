@@ -89,8 +89,8 @@ module Cohere
 
           assert errors.empty?, errors.empty? ? nil : errors.pop.full_message
           ref = Pathname(directory).join("models--owner--model/refs/feature/audio")
-          assert_includes commits, ref.read.strip
-          assert_equal 41, ref.size
+          assert_includes commits, ref.read
+          assert_equal 40, ref.size
           assert_empty Dir.glob(File.join(ref.dirname, ".cohere-transcribe-ref-*.tmp"))
         end
       end
@@ -332,7 +332,7 @@ module Cohere
         assert_equal limit, hub.instance_variable_get(:@resolution_memo).length
       end
 
-      def test_slow_concurrent_revision_lookup_cannot_replace_a_cached_success
+      def test_concurrent_misses_return_their_own_complete_online_responses
         Dir.mktmpdir("cohere-hub-concurrent-resolution") do |directory|
           late_commit = "d" * 40
           current_commit = "e" * 40
@@ -342,11 +342,7 @@ module Cohere
           requests = 0
           hub = Hub.new(cache_dir: directory, endpoint: "https://example.invalid")
           hub.define_singleton_method(:request) do |_uri, **_options|
-            index = request_guard.synchronize do
-              current = requests
-              requests += 1
-              current
-            end
+            index = request_guard.synchronize { (requests += 1) - 1 }
             if index.zero?
               entered_late_request << true
               release_late_request.pop
@@ -361,14 +357,11 @@ module Cohere
           current = Thread.new { hub.resolve_revision("owner/model", "main") }
 
           assert_equal current_commit, Timeout.timeout(2) { current.value }
-          assert_equal current_commit, hub.resolve_revision("owner/model", "main")
-          assert_equal 2, requests
-
           release_late_request << true
-          assert_equal current_commit, late.value
-          assert_equal current_commit,
+          assert_equal late_commit, late.value
+          assert_equal late_commit,
                        Pathname(directory).join("models--owner--model/refs/main").read.strip
-          assert_equal current_commit, hub.resolve_revision("owner/model", "main")
+          assert_equal late_commit, hub.resolve_revision("owner/model", "main")
           assert_equal 2, requests
         ensure
           release_late_request << true
@@ -379,265 +372,155 @@ module Cohere
         end
       end
 
-      def test_late_revision_lookup_cannot_replace_a_newer_ref_after_two_memo_expirations
-        Dir.mktmpdir("cohere-hub-expired-concurrent-resolution") do |directory|
-          stale_commit = "1" * 40
-          current_commit = "2" * 40
-          entered_stale_request = Queue.new
-          release_stale_request = Queue.new
-          request_guard = Mutex.new
-          requests = 0
-          clock = 100.0
+      def test_deleted_ref_during_resolution_is_recreated_from_the_valid_response
+        Dir.mktmpdir("cohere-hub-deleted-ref") do |directory|
+          old_commit = cache_snapshot(directory)
+          new_commit = "2" * 40
+          ref = Pathname(directory).join("models--owner--model/refs/main")
           hub = Hub.new(cache_dir: directory, endpoint: "https://example.invalid")
-          hub.define_singleton_method(:monotonic) { clock }
           hub.define_singleton_method(:request) do |_uri, **_options|
-            index = request_guard.synchronize do
-              current = requests
-              requests += 1
-              current
-            end
-            if index.zero?
-              entered_stale_request << true
-              release_stale_request.pop
-              Struct.new(:body).new(JSON.generate("sha" => stale_commit))
-            else
-              Struct.new(:body).new(JSON.generate("sha" => current_commit))
-            end
+            ref.delete
+            Struct.new(:body).new(JSON.generate("sha" => new_commit))
           end
 
-          stale = Thread.new { hub.resolve_revision("owner/model", "main") }
-          entered_stale_request.pop
-          clock += Hub.const_get(:RESOLUTION_MEMO_TTL_SECONDS)
-
-          assert_equal current_commit, hub.resolve_revision("owner/model", "main")
-          clock += Hub.const_get(:RESOLUTION_MEMO_TTL_SECONDS)
-          release_stale_request << true
-
-          assert_equal current_commit, stale.value
-          assert_equal current_commit,
-                       Pathname(directory).join("models--owner--model/refs/main").read.strip
-          assert_equal 2, requests
-          assert_empty hub.instance_variable_get(:@resolution_states)
-        ensure
-          release_stale_request << true
-          stale&.kill
-          stale&.join
+          assert_equal new_commit, hub.resolve_revision("owner/model", "main")
+          assert_equal new_commit, ref.read.strip
+          refute_equal old_commit, ref.read.strip
         end
       end
 
-      def test_late_revision_lookup_cannot_replace_a_ref_published_by_another_hub_instance
-        Dir.mktmpdir("cohere-hub-cross-instance-resolution") do |directory|
-          stale_commit = "3" * 40
-          current_commit = "4" * 40
-          entered_stale_request = Queue.new
-          release_stale_request = Queue.new
-          stale_hub = Hub.new(cache_dir: directory, endpoint: "https://example.invalid")
-          current_hub = Hub.new(cache_dir: directory, endpoint: "https://example.invalid")
-          stale_hub.define_singleton_method(:request) do |_uri, **_options|
-            entered_stale_request << true
-            release_stale_request.pop
-            Struct.new(:body).new(JSON.generate("sha" => stale_commit))
-          end
-          current_hub.define_singleton_method(:request) do |_uri, **_options|
-            Struct.new(:body).new(JSON.generate("sha" => current_commit))
+      def test_unreadable_ref_does_not_block_online_resolution_and_is_repaired
+        Dir.mktmpdir("cohere-hub-unreadable-ref") do |directory|
+          new_commit = "4" * 40
+          cache_snapshot(directory)
+          ref = Pathname(directory).join("models--owner--model/refs/main")
+          ref.chmod(0o000)
+          hub = Hub.new(cache_dir: directory, endpoint: "https://example.invalid")
+          hub.define_singleton_method(:request) do |_uri, **_options|
+            Struct.new(:body).new(JSON.generate("sha" => new_commit))
           end
 
-          stale = Thread.new { stale_hub.resolve_revision("owner/model", "main") }
-          entered_stale_request.pop
-          assert_equal current_commit, current_hub.resolve_revision("owner/model", "main")
-          release_stale_request << true
-
-          assert_equal current_commit, stale.value
-          assert_equal current_commit,
-                       Pathname(directory).join("models--owner--model/refs/main").read.strip
+          assert_equal new_commit, hub.resolve_revision("owner/model", "main")
+          assert_equal new_commit, ref.read.strip
+          assert_equal (ref.dirname.stat.mode & 0o666) | 0o600, ref.stat.mode & 0o777
         ensure
-          release_stale_request << true
-          stale&.kill
-          stale&.join
+          ref&.chmod(0o600) if ref&.exist?
         end
       end
 
-      def test_separate_process_ref_publishers_serialize_the_observed_ref_check
-        skip "fork is unavailable" unless Process.respond_to?(:fork)
-
-        current_pid = nil
-        stale_pid = nil
-        current_waited = false
-        stale_waited = false
-        Dir.mktmpdir("cohere-hub-process-resolution") do |directory|
-          stale_commit = "9" * 40
-          current_commit = "a" * 40
+      def test_shared_cache_ref_mode_follows_the_refs_directory_and_creates_no_lock
+        Dir.mktmpdir("cohere-hub-shared-ref") do |directory|
+          commit = "5" * 40
+          repository = Pathname(directory).join("models--owner--model")
+          refs = repository.join("refs").tap(&:mkpath)
+          refs.chmod(0o770)
           hub = Hub.new(cache_dir: directory)
-          observed = hub.send(:capture_ref_snapshot, "owner/model", "main")
-          current_ready_read, current_ready_write = IO.pipe
-          release_current_read, release_current_write = IO.pipe
-          current_pid = Process.fork do
-            current_ready_read.close
-            release_current_write.close
-            current_hub = Hub.new(cache_dir: directory)
-            original_verify = current_hub.method(:verify_cache_lock_identity!)
-            verify_calls = 0
-            current_hub.define_singleton_method(:verify_cache_lock_identity!) do |*arguments, **keywords|
-              original_verify.call(*arguments, **keywords)
-              verify_calls += 1
-              next unless verify_calls == 2
 
-              current_ready_write.write("1")
-              release_current_read.read(1)
-            end
-            value = current_hub.send(
-              :write_ref,
-              "owner/model",
-              "main",
-              current_commit,
-              expected_snapshot: nil
-            )
-            exit!(value == current_commit ? 0 : 41)
-          end
-          current_ready_write.close
-          release_current_read.close
-          assert_equal "1", current_ready_read.read(1)
-          current_ready_read.close
+          hub.send(:write_ref, "owner/model", "main", commit)
 
-          stale_started_read, stale_started_write = IO.pipe
-          stale_result_read, stale_result_write = IO.pipe
-          stale_pid = Process.fork do
-            release_current_write.close
-            stale_started_read.close
-            stale_result_read.close
-            stale_started_write.write("1")
-            stale_started_write.close
-            value = hub.send(
-              :write_ref,
-              "owner/model",
-              "main",
-              stale_commit,
-              expected_snapshot: observed
-            )
-            stale_result_write.write(value)
-            stale_result_write.close
-            exit!(value == current_commit ? 0 : 42)
-          end
-          stale_started_write.close
-          stale_result_write.close
-          assert_equal "1", stale_started_read.read(1)
-          stale_started_read.close
-          assert_nil stale_result_read.wait_readable(0.1),
-                     "stale publisher passed the held reference lock"
-
-          release_current_write.write("1")
-          release_current_write.close
-          _, current_status = Process.wait2(current_pid)
-          current_waited = true
-          assert current_status.success?, "current reference publisher failed"
-          assert_equal current_commit, stale_result_read.read
-          stale_result_read.close
-          _, stale_status = Process.wait2(stale_pid)
-          stale_waited = true
-          assert stale_status.success?, "stale reference publisher was not suppressed"
-          assert_equal current_commit,
-                       Pathname(directory).join("models--owner--model/refs/main").read.strip
-        end
-      ensure
-        [[current_pid, current_waited], [stale_pid, stale_waited]].each do |pid, waited|
-          next unless pid && !waited
-
-          Process.kill("KILL", pid)
-          Process.wait(pid)
-        rescue Errno::ESRCH, Errno::ECHILD
-          nil
+          ref = refs.join("main")
+          assert_equal commit, ref.read.strip
+          assert_equal 0o660, ref.stat.mode & 0o777
+          assert_empty Dir.glob(repository.join("*.ref.lock").to_s)
         end
       end
 
-      def test_post_rename_sync_failure_cannot_let_an_older_response_restore_the_previous_ref
-        Dir.mktmpdir("cohere-hub-post-rename-failure") do |directory|
-          stale_commit = "5" * 40
-          current_commit = "6" * 40
-          entered_stale_request = Queue.new
-          release_stale_request = Queue.new
-          request_guard = Mutex.new
-          requests = 0
+      def test_nested_ref_directories_inherit_shared_cache_mode_despite_private_umask
+        Dir.mktmpdir("cohere-hub-shared-nested-ref") do |directory|
+          cache = Pathname(directory).join("hub").tap(&:mkpath)
+          cache.chmod(0o2770)
+          commit = "6" * 40
+          previous_umask = File.umask(0o077)
+          begin
+            Hub.new(cache_dir: cache).send(:write_ref, "owner/model", "feature/audio", commit)
+          ensure
+            File.umask(previous_umask)
+          end
+
+          repository = cache.join("models--owner--model")
+          refs = repository.join("refs")
+          nested = refs.join("feature")
+          ref = nested.join("audio")
+          [repository, refs, nested].each do |path|
+            assert_equal 0o2770, path.stat.mode & 0o2777, path.to_s
+          end
+          assert_equal commit, ref.read
+          assert_equal 0o660, ref.stat.mode & 0o777
+        end
+      end
+
+      def test_download_payload_and_lock_inherit_shared_cache_mode_despite_private_umask
+        Dir.mktmpdir("cohere-hub-shared-download") do |directory|
+          cache = Pathname(directory).join("hub").tap(&:mkpath)
+          cache.chmod(0o2770)
+          commit = "7" * 40
+          hub = Hub.new(cache_dir: cache, endpoint: "https://example.invalid")
+          hub.define_singleton_method(:request) do |_uri, stream: nil, **_options|
+            stream.write("shared payload")
+          end
+          previous_umask = File.umask(0o077)
+          begin
+            destination = hub.download("owner/model", "nested/weights.bin", revision: commit)
+          ensure
+            File.umask(previous_umask)
+          end
+
+          lock = hub.send(:download_lock_path, destination)
+          assert_equal "shared payload", destination.read
+          assert_equal 0o660, destination.stat.mode & 0o777
+          assert_equal 0o660, lock.stat.mode & 0o777
+          assert_equal 0o2770, destination.dirname.stat.mode & 0o2777
+        end
+      end
+
+      def test_download_lock_filesystem_failures_remain_typed
+        errors = [Errno::ENOLCK]
+        errors << Errno::EOPNOTSUPP if Errno.const_defined?(:EOPNOTSUPP)
+        errors.each do |error_class|
+          Dir.mktmpdir("cohere-hub-download-lock-error") do |directory|
+            hub = Hub.new(cache_dir: directory, endpoint: "https://example.invalid")
+            hub.define_singleton_method(:open_download_lock) do |_path|
+              raise error_class, "simulated cache mount lock failure"
+            end
+
+            error = assert_raises(Hub::Error, error_class.name) do
+              hub.download("owner/model", "weights.bin", revision: "7" * 40)
+            end
+            assert_instance_of Hub::Error, error
+            assert_match(%r{Cannot cache owner/model/weights\.bin}, error.message)
+          end
+        end
+      end
+
+      def test_ref_publication_failure_does_not_invalidate_a_valid_online_resolution
+        commit = "6" * 40
+        hub = Hub.new(endpoint: "https://example.invalid")
+        hub.define_singleton_method(:request) do |_uri, **_options|
+          Struct.new(:body).new(JSON.generate("sha" => commit))
+        end
+        hub.define_singleton_method(:write_ref) do |*_arguments|
+          raise Errno::EACCES, "shared cache is read-only"
+        end
+
+        assert_equal commit, hub.resolve_revision("owner/model", "main")
+        assert_equal commit, hub.resolve_revision("owner/model", "main")
+      end
+
+      def test_ref_sync_failure_does_not_invalidate_a_valid_online_resolution
+        Dir.mktmpdir("cohere-hub-ref-sync-failure") do |directory|
+          commit = "7" * 40
           hub = Hub.new(cache_dir: directory, endpoint: "https://example.invalid")
           hub.define_singleton_method(:request) do |_uri, **_options|
-            index = request_guard.synchronize do
-              current = requests
-              requests += 1
-              current
-            end
-            if index.zero?
-              entered_stale_request << true
-              release_stale_request.pop
-              Struct.new(:body).new(JSON.generate("sha" => stale_commit))
-            else
-              Struct.new(:body).new(JSON.generate("sha" => current_commit))
-            end
+            Struct.new(:body).new(JSON.generate("sha" => commit))
           end
-          failed_sync = false
-          original_sync = hub.method(:sync_directory)
-          hub.define_singleton_method(:sync_directory) do |path|
-            unless failed_sync
-              failed_sync = true
-              raise Errno::EIO, "simulated ref directory sync failure"
-            end
-
-            original_sync.call(path)
+          hub.define_singleton_method(:sync_directory) do |_path|
+            raise Errno::EIO, "simulated ref directory sync failure"
           end
 
-          stale = Thread.new { hub.resolve_revision("owner/model", "main") }
-          entered_stale_request.pop
-          assert_raises(Errno::EIO) { hub.resolve_revision("owner/model", "main") }
-          release_stale_request << true
-
-          assert_equal current_commit, stale.value
-          assert_equal current_commit,
+          assert_equal commit, hub.resolve_revision("owner/model", "main")
+          assert_equal commit,
                        Pathname(directory).join("models--owner--model/refs/main").read.strip
-          assert_equal 2, requests
-        ensure
-          release_stale_request << true
-          stale&.kill
-          stale&.join
         end
-      end
-
-      def test_late_transient_lookup_returns_a_newer_published_result_after_memo_expiration
-        current_commit = "7" * 40
-        entered_stale_request = Queue.new
-        release_stale_request = Queue.new
-        request_guard = Mutex.new
-        requests = 0
-        clock = 100.0
-        hub = Hub.new(endpoint: "https://example.invalid")
-        hub.define_singleton_method(:monotonic) { clock }
-        hub.define_singleton_method(:write_ref) { |_repo_id, _revision, commit, **_options| commit }
-        hub.define_singleton_method(:request) do |_uri, **_options|
-          index = request_guard.synchronize do
-            current = requests
-            requests += 1
-            current
-          end
-          if index.zero?
-            entered_stale_request << true
-            release_stale_request.pop
-            raise Hub::ConnectionError, "stale request failed"
-          end
-
-          Struct.new(:body).new(JSON.generate("sha" => current_commit))
-        end
-
-        stale = Thread.new { hub.resolve_revision("owner/model", "main") }
-        entered_stale_request.pop
-        clock += Hub.const_get(:RESOLUTION_MEMO_TTL_SECONDS)
-        assert_equal current_commit, hub.resolve_revision("owner/model", "main")
-        clock += Hub.const_get(:RESOLUTION_MEMO_TTL_SECONDS)
-        release_stale_request << true
-
-        assert_equal current_commit, stale.value
-        assert_equal 2, requests
-        assert_empty hub.instance_variable_get(:@resolution_states)
-      ensure
-        release_stale_request << true
-        stale&.kill
-        stale&.join
       end
 
       def test_unrelated_memo_hit_is_not_blocked_by_ref_fsync
@@ -673,50 +556,7 @@ module Cohere
         slow&.join
       end
 
-      def test_first_same_reference_writer_remains_authoritative_while_ref_fsync_runs
-        first_commit = "5" * 40
-        second_commit = "6" * 40
-        write_started = Queue.new
-        finish_write = Queue.new
-        request_guard = Mutex.new
-        requests = 0
-        writes = []
-        hub = Hub.new(endpoint: "https://example.invalid")
-        hub.define_singleton_method(:request) do |_uri, **_options|
-          index = request_guard.synchronize do
-            current = requests
-            requests += 1
-            current
-          end
-          commit = index.zero? ? first_commit : second_commit
-          Struct.new(:body).new(JSON.generate("sha" => commit))
-        end
-        hub.define_singleton_method(:write_ref) do |_repo_id, _revision, commit, **_options|
-          writes << commit
-          write_started << true
-          finish_write.pop
-          commit
-        end
-
-        first = Thread.new { hub.resolve_revision("owner/model", "main") }
-        write_started.pop
-        second = Thread.new { hub.resolve_revision("owner/model", "main") }
-        Timeout.timeout(2) { Thread.pass until request_guard.synchronize { requests == 2 } }
-        finish_write << true
-
-        assert_equal first_commit, first.value
-        assert_equal first_commit, second.value
-        assert_equal [first_commit], writes
-        assert_equal 2, requests
-      ensure
-        finish_write << true
-        first&.kill
-        first&.join
-        second&.kill
-        second&.join
-      end
-
-      def test_killed_revision_request_retires_its_sequence_state
+      def test_killed_revision_request_leaves_no_memo_entry
         request_started = Queue.new
         hub = Hub.new(endpoint: "https://example.invalid")
         hub.define_singleton_method(:request) do |_uri, **_options|
@@ -730,34 +570,7 @@ module Cohere
         worker.kill
 
         assert worker.join(2), "killed Hub request did not finish"
-        assert_empty hub.instance_variable_get(:@resolution_states)
-      ensure
-        worker&.kill
-        worker&.join
-      end
-
-      def test_kill_during_ref_observation_is_prompt_and_registers_no_ticket
-        observation_started = Queue.new
-        requests = 0
-        hub = Hub.new(endpoint: "https://example.invalid")
-        hub.define_singleton_method(:capture_ref_snapshot) do |_repo_id, _revision|
-          observation_started << true
-          sleep
-        end
-        hub.define_singleton_method(:request) do |_uri, **_options|
-          requests += 1
-          raise "request must not start before ref observation finishes"
-        end
-        worker = Thread.new { hub.resolve_revision("owner/model", "main") }
-        worker.report_on_exception = false
-        observation_started.pop
-
-        worker.kill
-
-        assert worker.join(2), "Hub resolver did not terminate during ref observation"
-        assert_nil worker.value
-        assert_equal 0, requests
-        assert_empty hub.instance_variable_get(:@resolution_states)
+        assert_empty hub.instance_variable_get(:@resolution_memo)
       ensure
         worker&.kill
         worker&.join
@@ -791,7 +604,7 @@ module Cohere
 
           assert worker.join(2), "Hub resolver did not terminate during ref sync"
           assert_nil worker.value
-          assert_empty hub.instance_variable_get(:@resolution_states)
+          assert_empty hub.instance_variable_get(:@resolution_memo)
           assert_equal commit,
                        Pathname(directory).join("models--owner--model/refs/main").read.strip
           assert_equal commit, hub.resolve_revision("owner/model", "main")
@@ -815,17 +628,17 @@ module Cohere
         assert_match(/Invalid Hub response/, error.message)
       end
 
-      def test_invalid_revision_schema_is_definitive
+      def test_invalid_revision_schema_is_transient
         [JSON.generate([]), JSON.generate("sha" => "short")].each do |body|
           hub = Hub.new(endpoint: "https://example.invalid")
           hub.define_singleton_method(:request) do |_uri, **_options|
             Struct.new(:body).new(body)
           end
 
-          error = assert_raises(Hub::Error, body) do
+          error = assert_raises(Hub::TransientError, body) do
             hub.resolve_revision("owner/model", "main")
           end
-          assert_instance_of Hub::Error, error
+          assert_instance_of Hub::TransientError, error
         end
       end
 
@@ -877,6 +690,23 @@ module Cohere
 
         assert_equal %w[config.json weights.bin], files
         assert_predicate files, :frozen?
+      end
+
+      def test_file_list_rejects_an_all_malformed_sibling_list_accurately
+        commit = "f" * 40
+        hub = Hub.new(endpoint: "https://example.invalid")
+        hub.define_singleton_method(:request) do |_uri, **_options|
+          Struct.new(:body).new(
+            JSON.generate("siblings" => [{}, nil, { "rfilename" => 123 }, { "rfilename" => "" }])
+          )
+        end
+
+        error = assert_raises(Hub::Error) do
+          hub.list_files("owner/model", revision: commit)
+        end
+
+        assert_instance_of Hub::Error, error
+        assert_match(/no valid repository file entries/, error.message)
       end
 
       def test_valid_file_list_is_returned_frozen
@@ -959,19 +789,16 @@ module Cohere
         end
       end
 
-      def test_invalid_revision_schema_does_not_reuse_a_warm_snapshot
+      def test_invalid_revision_schema_reuses_a_warm_snapshot
         [JSON.generate([]), JSON.generate("sha" => "short")].each do |body|
           Dir.mktmpdir("cohere-hub-schema-failure") do |directory|
-            cache_snapshot(directory)
+            commit = cache_snapshot(directory)
             hub = Hub.new(cache_dir: directory, endpoint: "https://example.invalid")
             hub.define_singleton_method(:request) do |_uri, **_options|
               Struct.new(:body).new(body)
             end
 
-            error = assert_raises(Hub::Error, body) do
-              hub.resolve_revision("owner/model", "main")
-            end
-            assert_instance_of Hub::Error, error
+            assert_equal commit, hub.resolve_revision("owner/model", "main"), body
           end
         end
       end

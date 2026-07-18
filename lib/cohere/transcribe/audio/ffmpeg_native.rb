@@ -23,11 +23,14 @@ module Cohere
         class Library
           FUNCTIONS = {
             probe: [%i[voidp size_t], :int],
-            versions: [%i[voidp size_t], :int],
             decode: [%i[voidp int uint64 voidp voidp voidp size_t], :int],
             duration: [%i[voidp voidp voidp size_t], :int],
             cancel: [[], :void],
             free: [[:voidp], :void]
+          }.freeze
+
+          OPTIONAL_FUNCTIONS = {
+            versions: [%i[voidp size_t], :int]
           }.freeze
 
           TYPE_MAP = {
@@ -98,15 +101,15 @@ module Cohere
           def initialize(path)
             @path = path
             @handle = Fiddle::Handle.new(path, Fiddle::RTLD_NOW)
-            @functions = FUNCTIONS.to_h do |name, (arguments, result)|
-              address = @handle["cohere_audio_ffmpeg_#{name}"]
-              function = Fiddle::Function.new(
-                address,
-                arguments.map { |type| TYPE_MAP.fetch(type) },
-                TYPE_MAP.fetch(result)
-              )
-              [name, function]
-            end.freeze
+            functions = FUNCTIONS.to_h do |name, signature|
+              [name, bind_function(name, signature)]
+            end
+            OPTIONAL_FUNCTIONS.each do |name, signature|
+              functions[name] = bind_function(name, signature)
+            rescue Fiddle::DLError
+              nil
+            end
+            @functions = functions.freeze
           end
 
           def probe!
@@ -116,10 +119,13 @@ module Cohere
             @diagnostic = message.to_s.force_encoding(Encoding::UTF_8).scrub.freeze
             raise TranscriptionRuntimeError, "Native FFmpeg libraries are unavailable: #{@diagnostic}" unless status.zero?
 
+            versions = @functions[:versions]
+            return clear_ffmpeg_versions unless versions
+
             tuple_bytes = 4 * Fiddle::SIZEOF_INT
             tuple = Fiddle::Pointer.malloc(tuple_bytes, Fiddle::RUBY_FREE)
             tuple[0, tuple_bytes] = [0, 0, 0, 0].pack("i!*")
-            version_status = @functions.fetch(:versions).call(tuple, 4)
+            version_status = versions.call(tuple, 4)
             unless version_status.zero?
               raise TranscriptionRuntimeError,
                     "Native FFmpeg libraries did not report their version tuple: #{@diagnostic}"
@@ -241,6 +247,21 @@ module Cohere
           private
 
           private :decode_owned
+
+          def bind_function(name, (arguments, result))
+            address = @handle["cohere_audio_ffmpeg_#{name}"]
+            Fiddle::Function.new(
+              address,
+              arguments.map { |type| TYPE_MAP.fetch(type) },
+              TYPE_MAP.fetch(result)
+            )
+          end
+
+          def clear_ffmpeg_versions
+            @ffmpeg_versions = nil
+            @avutil_major = nil
+            self
+          end
 
           def c_string(value)
             Fiddle::Pointer["#{value}\0"]
