@@ -1149,7 +1149,8 @@ module Cohere
           target.path.dirname.mkdir(0o770)
           target.path.dirname.chmod(0o770)
           State.define_singleton_method(:apply_lock_mode_if_supported) do |candidate, mode|
-            mode_attempts << [Pathname(candidate), mode]
+            candidate_path = candidate.respond_to?(:path) ? candidate.path : candidate
+            mode_attempts << [Pathname(candidate_path), mode]
           end
 
           lock = State::OutputSetLock.acquire(target)
