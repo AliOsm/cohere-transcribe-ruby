@@ -819,7 +819,7 @@ module Cohere
           end
         end
 
-        def test_thread_kill_reports_an_incomplete_output_rollback_and_names_the_preserved_backup
+        def test_thread_kill_with_an_incomplete_output_rollback_remains_terminal
           original_rename = State::BoundDirectory.instance_method(:rename)
           State::BoundDirectory.define_method(:rename) do |source, destination|
             raise Errno::EIO, "forced restore failure" if source.end_with?(".bak")
@@ -837,31 +837,33 @@ module Cohere
               publishing_thread = Thread.current
               Thread.new { publishing_thread.kill }.join
             end
+            rescued = false
+            continued = false
             caller = Thread.new do
-              Publication.atomic_write_set(
-                { "txt" => destination },
-                { "txt" => "new transcript" },
-                operation_hook: hook
-              )
+              begin
+                Publication.atomic_write_set(
+                  { "txt" => destination },
+                  { "txt" => "new transcript" },
+                  operation_hook: hook
+                )
+              rescue TranscriptionRuntimeError
+                rescued = true
+              end
+              continued = true
             end
             caller.report_on_exception = false
 
-            error = assert_raises(TranscriptionRuntimeError) do
-              Timeout.timeout(2) { caller.join }
-            end
-            assert_match(/recovery was incomplete/, error.message)
+            assert caller.join(2), "output publisher remained stuck after termination"
+            assert_nil caller.value
+            refute rescued, "recovery failure replaced Thread#kill with a catchable exception"
+            refute continued, "output publisher continued after Thread#kill"
             retained = root.children.select { |path| path.extname == ".bak" }
             assert_equal 1, retained.length
             assert_equal "old transcript", retained.fetch(0).binread
-            assert_includes error.message, retained.fetch(0).to_s
             refute destination.exist?
           ensure
             caller&.kill
-            begin
-              caller&.join
-            rescue TranscriptionRuntimeError
-              nil
-            end
+            caller&.join
           end
         ensure
           State::BoundDirectory.define_method(:rename, original_rename) if original_rename

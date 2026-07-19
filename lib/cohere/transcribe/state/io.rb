@@ -374,7 +374,9 @@ module Cohere
       def finish_atomic_recovery!(subject:, completed:, primary_error:, recovery_errors:,
                                   retained_backups:)
         return if recovery_errors.empty?
-        return if completed && primary_error.nil? && Thread.current.status == "aborting"
+        # Raising from an ensure during Thread#kill replaces termination with a
+        # catchable exception, so cleanup remains best effort while aborting.
+        return if Thread.current.status == "aborting"
 
         outcome = if completed
                     "completed but cleanup was incomplete"

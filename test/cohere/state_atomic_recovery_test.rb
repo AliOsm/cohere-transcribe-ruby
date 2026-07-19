@@ -53,6 +53,38 @@ module Cohere
         end
       end
 
+      def test_recovery_failure_does_not_replace_thread_kill_during_an_existing_failure
+        rescued = false
+        continued = false
+        caller = Thread.new do
+          begin
+            begin
+              Thread.current.kill
+            ensure
+              State.finish_atomic_recovery!(
+                subject: "State commit",
+                completed: false,
+                primary_error: RuntimeError.new("original failure"),
+                recovery_errors: ["forced cleanup failure"],
+                retained_backups: ["retained.bak"]
+              )
+            end
+          rescue TranscriptionRuntimeError
+            rescued = true
+          end
+          continued = true
+        end
+        caller.report_on_exception = false
+
+        assert caller.join(2), "state recovery probe remained stuck after termination"
+        assert_nil caller.value
+        refute rescued, "recovery failure replaced Thread#kill with a catchable exception"
+        refute continued, "state recovery probe continued after Thread#kill"
+      ensure
+        caller&.kill
+        caller&.join
+      end
+
       def test_incomplete_state_recovery_is_typed_and_preserves_the_primary_failure
         with_state_files("cohere-state-recovery") do |root, source, marker|
           rename = lambda do |bound, from, to, phase|
